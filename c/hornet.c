@@ -1747,6 +1747,7 @@ static int cmd_rmdup_pe(int argc, char **argv)
     hts_tpool *pool;
     memset(&F, 0, sizeof F);
     open_dedup_io(argc, argv, &F.in, &F.out, &F.hdr, &pool, "rmdup_pe");
+    fprintf(stderr, "WARNING: rmdup_pe keeps every read pair whose mate is found within its window, so it removes few or no duplicates (original Hornet algorithm, kept for reproducibility). For duplicate removal use Picard MarkDuplicates --REMOVE_DUPLICATES true --DUPLICATE_SCORING_STRATEGY RANDOM, or samtools markdup -r.\n");
     F.W = 10000;
     F.table = calloc(F.W, sizeof(blist_t));
     F.occupied = calloc(F.W, 1);

@@ -16,12 +16,14 @@ that is originally described in
 High-performance version
 ########################
 
-This fork contains two faster implementations of every step. Both produce
+This fork contains two faster implementations of every step, with three bugs
+of the original code fixed (see `Fixes`_). With ``--legacy`` both produce
 **exactly the same results as the original code**: the same BAM records in
 the same order, the same fastq content (byte for byte after decompression) and
 the same run statistics. This is checked by ``tests/run_equivalence.sh``,
 which runs the original scripts (taken from upstream commit ``e642ac0``) next
-to the new ones on synthetic data covering the corner cases (indels,
+to the new ones, and checks the fixed default behaviour against reference
+implementations, on synthetic data covering the corner cases (indels,
 duplicated and multi-allelic SNP rows, ``N``/``D``/``I``/``S``/``H``/``=``/``X``
 CIGARs, >32 SNP combinations, unmapped mates, secondary alignments, improper
 pairs, phased mode, ``-C``, consolidated ``all.txt.gz``, ...).
@@ -81,23 +83,124 @@ rmdup                    28.1 s             6.7 s                               
 SNP memory use is ~12 bytes per SNP in both new versions, against ~150 bytes
 per SNP in the original nested dictionaries (about 10 GB for 70 M SNPs).
 
-Behaviour kept for compatibility
---------------------------------
+Fixes
+-----
 
-Because the output has to be identical, a few quirks of the original code are
-reproduced on purpose:
+The default behaviour fixes three bugs of the original code; ``--legacy``
+(``find_intersecting_snps`` and ``filter_remapped_reads``) restores the
+original behaviour exactly.
 
-* Phased mode (``-P``) never counts covered SNPs, so the original crashes with
-  ``ZeroDivisionError`` while printing the statistics (after all output files
-  are written). The new versions print ``nan`` for that percentage and finish.
-* The fastq qualities of reverse-strand reads are written in reference
-  orientation although the sequence is reverse-complemented.
-* In single-end mode ``filter_remapped_reads`` also skips the read that
-  follows a read which failed to remap.
-* ``rmdup.py`` keeps only reads with flag 0 or 16 and never writes the last
-  position of the file; ``rmdup_pe.py`` writes every read whose mate is found
-  in its window (so it removes few duplicates) and drops pairs whose mates
-  start at the same position.
+1. Phased mode (``-P``) never counted covered SNPs, so the original crashed
+   with ``ZeroDivisionError`` while printing the statistics. SNPs are now
+   counted, and pairs dropped because a read base matches neither allele are
+   reported (``Reads dropped [non ref/alt base]``). Output files are unchanged.
+2. In the remap fastqs the sequence of a reverse-strand read is reverse
+   complemented back to the sequenced orientation, but its qualities were not
+   reversed. They are now.
+3. In single-end mode ``filter_remapped_reads`` treated the read following
+   each discarded read as its mate and skipped it, losing reads that had
+   remapped correctly. Paired-end output is unchanged.
+
+Duplicate removal
+-----------------
+
+``rmdup_pe.py`` does not work as intended: it writes every read pair whose
+mate is found within its window, so it removes almost no duplicates (on the
+simulation below it kept 900,355 of 900,357 pairs, leaving 359,225 PCR
+duplicates), and it drops pairs whose mates start at the same position.
+``rmdup.py`` (single-end) finds the usual duplicate set but keeps only reads
+with flag 0 or 16 and never writes the last position of the file. Both are
+kept, unchanged, for reproducibility; ``rmdup_pe`` now prints a warning.
+
+Use a standard duplicate marker instead. What matters for allele-specific
+analysis is that the read kept from each duplicate set is not chosen by a
+score that depends on the allele (e.g. alignment score or mapping quality,
+which are lower for reads carrying the non-reference allele):
+
+.. code:: shell
+
+  # recommended: Picard picks the kept read by a hash of its name
+  java -jar picard.jar MarkDuplicates -I in.bam -O dedup.bam -M dup_metrics.txt \
+      --REMOVE_DUPLICATES true --DUPLICATE_SCORING_STRATEGY RANDOM
+  # faster; keeps the read with the highest base-quality sum
+  samtools collate -O -u in.bam | samtools fixmate -m -u - - | \
+      samtools sort -u - | samtools markdup -r - dedup.bam
+
+On an ATAC-like simulation (400 high-depth peaks, 541,132 molecules, 900,357
+pairs with PCR duplicates; see ``tests/bench``) Picard
+(default and ``RANDOM``), ``samtools markdup``, ``samtools rmdup`` and WASP's
+``rmdup_pe.py`` all found the same duplicates (360,217-360,219 pairs removed,
+6-7 residual duplicates) and
+none changed the reference-allele fraction beyond sampling error. Picard
+needs a read group (``samtools addreplacerg``). Duplicates can be removed
+before ``find_intersecting_snps`` (less to remap) or after merging the
+filtered BAMs.
+
+Hornet, WASP and WASP2
+----------------------
+
+All three implement the same remap-and-filter idea. Measured on two simulated
+hg38 data sets (bowtie2, paired-end, MAPQ >= 10, heterozygous SNVs, each
+fragment drawn from either haplotype with p = 0.5, so the true reference
+fraction is 0.5):
+
+================================ ================== ================== ==================
+                                 reference fraction reads at SNVs kept find + filter time
+================================ ================== ================== ==================
+**A**: 3.5 M pairs, 1 SNV/500 bp
+raw mapping                      0.50137            1,227,389
+Hornet (C)                       0.50041            1,223,114 (99.7%)  5 s
+WASP 0.3 (original, Python)      0.50040            1,223,149 (99.7%)  524 s
+WASP2 1.4.1 (phased)             --                 149 [2]_           --
+**B**: 1.8 M pairs, 1 SNV/100 bp
+raw mapping                      0.50388            2,164,071
+Hornet (C)                       0.50011            2,104,709 (97.3%)  10 s
+WASP 0.3 (original, Python)      0.50022            2,134,213 (98.6%)  852 s
+================================ ================== ================== ==================
+
+Hornet and WASP remove the bias equally well (both within sampling error,
+about +-0.0003, of 0.5). WASP keeps slightly more reads in SNP-dense regions
+because it allows 64 allelic combinations per read instead of Hornet's 32.
+
+Differences in the algorithms:
+
+* *Input*: Hornet reads all SNPs from text files (``pos ref alt``) and works
+  on unsorted BAMs; indels must be written with ``-``. WASP needs a sorted BAM
+  and can read genotypes/haplotypes from HDF5, generating only observed
+  haplotypes. WASP2 reads VCF/BCF/PGEN and selects the sample's heterozygous
+  sites. In all cases only the sample's heterozygous sites should be used.
+* *Read filtering*: WASP discards secondary, supplementary, improper and
+  cross-chromosome pairs; Hornet only requires the proper-pair flag
+  (single-end mode applies no flag filter), so filter the BAM first
+  (``samtools view -F 0x904 -q 10``).
+* *Filtering remapped reads*: WASP requires the remapped CIGAR to equal the
+  original and checks both mate positions; Hornet checks each read's start
+  and accepts only M/N/S CIGAR operations.
+* *Modes*: Hornet supports single-end and paired-end data, unphased SNPs (all
+  combinations) and ``-P`` for phased/hybrid data (one swapped read per read).
+  WASP supports single- and paired-end. WASP2 1.4.1 ``make-reads`` supports
+  only paired-end reads with phased genotypes (``Single-End not Implemented``,
+  ``Unphased not Implemented``), but adds indel-aware remapping, allele
+  counting, imbalance tests and single-cell support.
+
+.. [2] With phased genotypes WASP2 1.4.1 ``make-reads`` writes only the
+   haplotype that differs from the read but names it as one of two
+   (``..._1_2``/``..._2_2``, ``total_seqs = 2`` is fixed in
+   ``rust/src/bam_remapper.rs``); ``filter-remapped`` then waits for the
+   second haplotype and discards the read, so almost no SNP-overlapping reads
+   were kept. The same code is on the current master branch.
+
+ATAC-seq, ChIP-seq and other DNA data
+-------------------------------------
+
+The algorithm does not depend on the assay: any BAM from a DNA aligner
+(bowtie2, BWA) works, and the benchmarks above are of exactly that kind.
+Remap with the same aligner, options and MAPQ filter as the first mapping
+(e.g. the ``-X 2000`` used for ATAC-seq), run Hornet on the filtered BAM
+before any Tn5 shifting, and remove duplicates with Picard ``RANDOM`` (see
+above). Single-end ChIP-seq is supported. Hornet stops at the filtered BAM;
+count alleles at heterozygous sites in peaks with e.g. ``wasp2-count
+count-variants --regions peaks.bed`` or GATK ``ASEReadCounter``.
 
 Overview
 ########

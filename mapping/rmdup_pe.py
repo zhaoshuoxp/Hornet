@@ -27,6 +27,7 @@ def main():
 
     max_window=10000
     options = parser.parse_args()
+    sys.stderr.write('WARNING: rmdup_pe keeps every read pair whose mate is found within its window, so it removes few or no duplicates (original Hornet algorithm, kept for reproducibility). For duplicate removal use Picard MarkDuplicates --REMOVE_DUPLICATES true --DUPLICATE_SCORING_STRATEGY RANDOM, or samtools markdup -r.' + "\n")
     if options.seed is not None:
         random.seed(options.seed)
     threads = max(1, options.threads)
