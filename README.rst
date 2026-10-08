@@ -11,7 +11,93 @@ Introduction
 
 Hornet is a simple set of tools for unbiased allele-specific read mapping
 that is originally described in
-`van de Geijn B, McVicker G, Gilad Y, Pritchard JK. "WASP: allele-specific software for robust discovery of molecular quantitative trait loci" <https://www.nature.com/articles/nmeth.3582>
+`van de Geijn B, McVicker G, Gilad Y, Pritchard JK. "WASP: allele-specific software for robust discovery of molecular quantitative trait loci" <https://www.nature.com/articles/nmeth.3582>`_
+
+High-performance version
+########################
+
+This fork contains two faster implementations of every step. Both produce
+**exactly the same results as the original code**: the same BAM records in
+the same order, the same fastq content (byte for byte after decompression) and
+the same run statistics. This is checked by ``tests/run_equivalence.sh``,
+which runs the original scripts (taken from upstream commit ``e642ac0``) next
+to the new ones on synthetic data covering the corner cases (indels,
+duplicated and multi-allelic SNP rows, ``N``/``D``/``I``/``S``/``H``/``=``/``X``
+CIGARs, >32 SNP combinations, unmapped mates, secondary alignments, improper
+pairs, phased mode, ``-C``, consolidated ``all.txt.gz``, ...).
+
+``c/hornet`` (recommended)
+  A single C program built on htslib with one sub-command per script::
+
+    hornet find_intersecting_snps [-p] [-P] [-C chrom] [-t threads] in.bam SNP_dir
+    hornet filter_remapped_reads  [-p] [-t threads] to.remap.bam remap.sort.bam out.bam
+    hornet rmdup    [-t threads] [--seed N] in.bam out.bam
+    hornet rmdup_pe [-t threads] [--seed N] in.bam out.bam
+
+  Build it with::
+
+    cd c
+    make HTSLIB_PREFIX=$CONDA_PREFIX     # htslib from conda/bioconda, or
+    make HTSLIB_DIR=/path/to/htslib-1.x  # a compiled htslib source tree, or
+    make                                 # htslib found by pkg-config
+
+  An htslib built with libdeflate (e.g. ``conda install -c bioconda htslib``)
+  roughly halves the time spent compressing output.
+
+``mapping/*.py``
+  Drop-in replacements for the original Python scripts (same command lines,
+  plus ``-t/--threads``; ``find_intersecting_snps.py`` also has
+  ``-j/--processes``, which processes the chromosomes of a sorted and indexed
+  BAM in parallel). Requires pysam and numpy; pandas and pigz are used if
+  available.
+
+``rmdup.py``/``rmdup_pe.py`` pick duplicates at random. Both new versions make
+the same sequence of calls to Python's Mersenne Twister as the original, so
+``--seed N`` gives the same reads as the original script run after
+``random.seed(N)`` (the C version re-implements CPython's generator).
+
+Benchmark
+---------
+
+Simulated hg38 data: 3.55 M read pairs (bowtie2, MAPQ >= 10), 6.0 M SNPs
+(5% indels). Wall-clock time, 256-core Linux server; the C program is linked
+to htslib 1.21 with libdeflate.
+
+======================== ================== =================================== ===============================
+step                     original           Python (new)                        C
+======================== ================== =================================== ===============================
+find_intersecting_snps   366.8 s, 716 MB    137.0 s (-t 1), 55.2 s (-t 4),      41.7 s (-t 1), 10.4 s (-t 4),
+-p                                          13.7 s (-j 24, sorted input),       4.6 s (-t 16), 4.2 s (-t 32),
+                                            ~270 MB                             ~190 MB
+filter_remapped_reads -p 28.5 s, 154 MB     23.1 s (-t 1), 10.1 s (-t 4)        8.1 s (-t 1), 2.3 s (-t 4), 36 MB
+rmdup_pe                 359.3 s [1]_       23.1 s                              5.5 s
+rmdup                    28.1 s             6.7 s                               3.0 s
+======================== ================== =================================== ===============================
+
+.. [1] The original ``rmdup_pe.py`` calls ``AlignmentFile.next()``, which does
+   not exist in Python 3; it was run through a small compatibility shim
+   (``tests/shim_run.py``).
+
+SNP memory use is ~12 bytes per SNP in both new versions, against ~150 bytes
+per SNP in the original nested dictionaries (about 10 GB for 70 M SNPs).
+
+Behaviour kept for compatibility
+--------------------------------
+
+Because the output has to be identical, a few quirks of the original code are
+reproduced on purpose:
+
+* Phased mode (``-P``) never counts covered SNPs, so the original crashes with
+  ``ZeroDivisionError`` while printing the statistics (after all output files
+  are written). The new versions print ``nan`` for that percentage and finish.
+* The fastq qualities of reverse-strand reads are written in reference
+  orientation although the sequence is reverse-complemented.
+* In single-end mode ``filter_remapped_reads`` also skips the read that
+  follows a read which failed to remap.
+* ``rmdup.py`` keeps only reads with flag 0 or 16 and never writes the last
+  position of the file; ``rmdup_pe.py`` writes every read whose mate is found
+  in its window (so it removes few duplicates) and drops pairs whose mates
+  start at the same position.
 
 Overview
 ########
@@ -174,17 +260,24 @@ The merged file should then be indexed:
 Dependencies
 ############
 
-Hornet is writte in python and will work with python 2.6+. It requires
-`numpy <http://www.numpy.org>`_, `scipy <http://www.scipy.org>`_, and
-`pysam <https://github.com/pysam-developers/pysam>`_.
+The Python scripts need Python 3,
+`pysam <https://github.com/pysam-developers/pysam>`_ and
+`numpy <http://www.numpy.org>`_. `pandas <https://pandas.pydata.org>`_
+(faster SNP loading) and ``pigz`` (faster fastq compression) are used when
+available.
 
-It also depends on `argparse <https://code.google.com/p/argparse/>`_,
-which is included by default in newer versions of python (>= 2.7).
+The C program needs `htslib <https://github.com/samtools/htslib>`_ (>= 1.10)
+and zlib.
 
 Installation
 ############
 
 .. code:: shell
-   pip install https://github.com/TheFraserLab/Hornet/tarball/master
 
-Dependencied will be installed automatically.
+   git clone https://github.com/zhaoshuoxp/Hornet.git
+   cd Hornet/c && make HTSLIB_PREFIX=$CONDA_PREFIX   # C version
+   pip install pysam numpy pandas                    # Python version
+
+The Python scripts in ``mapping/`` can then be run directly; copy
+``c/hornet`` to a directory on your ``PATH``. To check both against the
+original code: ``tests/run_equivalence.sh`` (needs samtools).

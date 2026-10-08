@@ -101,6 +101,12 @@ retain the read with the highest score (which usually matches the reference). We
 	# for paired-end reads:
 	python rmdup_pe.py <sorted.input.bam> <output.bam>
 	
+## Faster implementations
+
+See the top-level README.rst: the scripts here are optimised drop-in replacements
+(identical output, new `-t/--threads` option; `find_intersecting_snps.py -j N`
+processes chromosomes in parallel), and `../c/hornet` implements the same tools in C.
+
 ## Testing
 
-To run the tests, execute `py.test` from within this directory.
+To check the new code against the original, run `../tests/run_equivalence.sh`.

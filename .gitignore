@@ -57,3 +57,6 @@ docs/_build/
 *.bam.bai
 *.fq1.gz
 *.fq2.gz
+
+# C build
+c/hornet
