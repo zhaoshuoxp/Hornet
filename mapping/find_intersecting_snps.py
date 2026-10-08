@@ -55,6 +55,9 @@ except ImportError:  # pragma: no cover
 
 MAX_SEQS_PER_READ = 32
 DRAW_PROGRESS = False
+# Reproduce the original Hornet output exactly, including its bugs
+# (--legacy). See README.rst, "Fixes".
+LEGACY = False
 
 
 def _now():
@@ -460,6 +463,16 @@ def _dual_read_seqs_core(snps, read_posns, seq1, seq2, dispositions, phased):
         for ref_pos in sorted(snps):
             pos1, pos2 = read_posns[ref_pos]
             alleles = snps[ref_pos]
+            if not LEGACY:
+                # The original never counted SNPs in phased mode (and then
+                # divided by zero when printing the statistics).
+                dispositions['total_snps'] += 1
+                if ((pos1 is not None and seq1[pos1] not in alleles) or
+                        (pos2 is not None and seq2[pos2] not in alleles)):
+                    dispositions['no_match'] += 1
+                    dispositions['non_refalt_base'] += 1
+                    return [[], []]
+                dispositions['ref_match'] += 1
             if pos1 is not None:
                 is_alt = alleles.find(seq1[pos1])
                 if is_alt == -1:
@@ -664,8 +677,15 @@ def write_read_seqs(both_read_seqs, keep, remap_bam, fastqs, dropped=None, remap
             right_pos,
             len(seqs[0])-1,
         )
-        quals = [read.qual for read in reads]
         rev = [read.is_reverse for read in reads]
+        if LEGACY:
+            quals = [read.qual for read in reads]
+        else:
+            # The sequence of a reverse-strand read is reverse complemented
+            # back to the sequenced orientation; its qualities must be
+            # reversed too.
+            quals = [(read.qual[::-1] if (is_rev and read.qual is not None)
+                      else read.qual) for read, is_rev in zip(reads, rev)]
 
         out = []
         first = True
@@ -867,7 +887,7 @@ def _pct(num, den):
         return "nan"
 
 
-def print_stats(read_results, n_unpaired, is_paired, keep_only):
+def print_stats(read_results, n_unpaired, is_paired, keep_only, phased=False):
     print()
     print(_now(), ".... Finished!")
     print()
@@ -904,6 +924,9 @@ def print_stats(read_results, n_unpaired, is_paired, keep_only):
     if is_paired:
         print("  Reads dropped [anomalous pair]:", read_results['toss_anomalous_phase'], "(" + \
             _pct(read_results['toss_anomalous_phase'], total_pairs) + "%)")
+        if phased and not LEGACY:
+            print("  Reads dropped [non ref/alt base]:", read_results['non_refalt_base'], "(" + \
+                _pct(read_results['non_refalt_base'], total_pairs) + "%)")
         print("  Reads dropped [not proper pair]:", read_results['not_proper_pair'], "(" + \
             _pct(read_results['not_proper_pair'], total_pairs) + "%)")
 
@@ -1157,7 +1180,7 @@ def assign_reads(insam, snp_dict, indel_dict=None, is_paired=True, phased=False,
         res = process_reads(insam, snp_dict, basename + '.', is_paired,
                             phased, keep_only, threads)
         result = res['results'], res['n_unpaired']
-    print_stats(result[0], result[1], is_paired, keep_only)
+    print_stats(result[0], result[1], is_paired, keep_only, phased)
 
 
 
@@ -1194,6 +1217,11 @@ if __name__ == "__main__":
     parser.add_argument('-t', '--threads', type=int, default=4,
                         help=('Threads for BAM/fastq (de)compression '
                               '(default: 4)'))
+    parser.add_argument('--legacy', action='store_true', default=False,
+                        help=('Reproduce the output of the original Hornet '
+                              'code exactly, including its bugs (phased-mode '
+                              'statistics, qualities of reverse-strand reads '
+                              'in the remap fastqs).'))
     parser.add_argument('-j', '--processes', type=int, default=1,
                         help=('Process chromosomes in parallel with this many '
                               'worker processes. Requires a coordinate sorted '
@@ -1219,6 +1247,7 @@ if __name__ == "__main__":
     DRAW_PROGRESS = False
     if options.progressbar:
         DRAW_PROGRESS = True
+    LEGACY = options.legacy
 
     INSAM = Samfile(options.infile, threads=max(1, options.threads))
     SNP_DICT = get_snps(options.snp_dir, options.limit_to_chrom,

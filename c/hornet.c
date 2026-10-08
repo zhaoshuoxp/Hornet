@@ -37,6 +37,11 @@
 
 #define MAX_SEQS_PER_READ 32
 
+/* --legacy: reproduce the original Hornet output exactly, including its bugs
+ * (phased-mode statistics, qualities of reverse-strand reads in the remap
+ * fastqs, single-end filter_remapped_reads skipping reads). */
+static int legacy = 0;
+
 /* ------------------------------------------------------------------------ */
 /* Utilities                                                                */
 /* ------------------------------------------------------------------------ */
@@ -567,7 +572,7 @@ static snptab_t *get_snps(const char *snpdir, const char *chrom_only, int nthrea
 typedef struct {
     int64_t total, skipped, no_snps, has_snps, total_snps, ref_match, no_match,
             toss_indel, toss_manysnps, toss_anomalous_phase, not_proper_pair,
-            unmapped;
+            unmapped, non_refalt_base;
 } counts_t;
 
 typedef struct {
@@ -782,6 +787,18 @@ static int dual_read_seqs(const bam1_t *b1, const bam1_t *b2, sites_t *S1,
         for (i = 0; i < n; i++) {
             const char *al = T->alleles[F[i].code];
             int alen = T->alen[F[i].code];
+            if (!legacy) {
+                /* The original never counted SNPs in phased mode. */
+                D->total_snps++;
+                if ((F[i].p1 >= 0 && !memchr(al, seq_at(Q1, 0, F[i].p1, b1), alen)) ||
+                    (F[i].p2 >= 0 && !memchr(al, seq_at(Q2, 0, F[i].p2, b2), alen))) {
+                    D->no_match++;
+                    D->non_refalt_base++;
+                    free(F);
+                    return 0;
+                }
+                D->ref_match++;
+            }
             if (F[i].p1 >= 0) {
                 char c = seq_at(Q1, 0, F[i].p1, b1);
                 const char *f = memchr(al, c, alen);
@@ -915,7 +932,12 @@ static void qual_string(const bam1_t *b, char **buf, size_t *m, size_t *len)
     const uint8_t *q = bam_get_qual(b);
     if (*m < (size_t)L + 8) { *m = L + 8; *buf = xrealloc(*buf, *m); }
     if (L == 0 || q[0] == 0xff) { strcpy(*buf, "None"); *len = 4; return; }
-    for (i = 0; i < L; i++) (*buf)[i] = (char)(q[i] + 33);
+    if ((b->core.flag & BAM_FREVERSE) && !legacy) {
+        /* the sequence is reverse complemented, so reverse the qualities */
+        for (i = 0; i < L; i++) (*buf)[i] = (char)(q[L - 1 - i] + 33);
+    } else {
+        for (i = 0; i < L; i++) (*buf)[i] = (char)(q[i] + 33);
+    }
     *len = L;
 }
 
@@ -1010,7 +1032,8 @@ static char *strcat3(const char *a, const char *b)
     return p;
 }
 
-static void print_find_stats(counts_t *R, int64_t n_unpaired, int is_paired, const char *keep_only)
+static void print_find_stats(counts_t *R, int64_t n_unpaired, int is_paired, const char *keep_only,
+                             int phased)
 {
     char p[64];
     int64_t total_pairs;
@@ -1042,6 +1065,11 @@ static void print_find_stats(counts_t *R, int64_t n_unpaired, int is_paired, con
         fmt_pct(p, R->toss_anomalous_phase, total_pairs);
         printf("  Reads dropped [anomalous pair]: %lld (%s%%)\n",
                (long long)R->toss_anomalous_phase, p);
+        if (phased && !legacy) {
+            fmt_pct(p, R->non_refalt_base, total_pairs);
+            printf("  Reads dropped [non ref/alt base]: %lld (%s%%)\n",
+                   (long long)R->non_refalt_base, p);
+        }
         fmt_pct(p, R->not_proper_pair, total_pairs);
         printf("  Reads dropped [not proper pair]: %lld (%s%%)\n",
                (long long)R->not_proper_pair, p);
@@ -1058,13 +1086,14 @@ static void bp_put(bpool_t *p, bam1_t *b) { GROW(p->b, p->n, p->m); p->b[p->n++]
 static void usage_find(void)
 {
     fprintf(stderr,
-"usage: hornet find_intersecting_snps [-p] [-C CHROM] [-s] [-P] [-t THREADS] infile snp_dir\n"
+"usage: hornet find_intersecting_snps [-p] [-C CHROM] [-s] [-P] [-t THREADS] [--legacy] infile snp_dir\n"
 "  -p, --paired_end        reads are paired-end (default is single)\n"
 "  -C, --limit-to-chrom    limit loading of SNPs to the specified chromosome\n"
 "  -s, --sorted            input is coordinate sorted (accepted, unused)\n"
 "  -P, --phased-snp-data   SNP data is phased\n"
 "  -t, --threads           threads for BAM/fastq (de)compression and SNP loading (default 4)\n"
-"      --progressbar       accepted for compatibility (ignored)\n");
+"      --progressbar       accepted for compatibility (ignored)\n"
+"      --legacy            reproduce the original output exactly, bugs included\n");
     exit(2);
 }
 
@@ -1078,6 +1107,7 @@ static int cmd_find(int argc, char **argv)
         {"progressbar", no_argument, 0, 1},
         {"threads", required_argument, 0, 't'},
         {"processes", required_argument, 0, 'j'},
+        {"legacy", no_argument, 0, 2},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}};
     int c, is_paired = 0, phased = 0, threads = 4;
@@ -1091,6 +1121,7 @@ static int cmd_find(int argc, char **argv)
         case 't': threads = atoi(optarg); break;
         case 'j': if (atoi(optarg) > threads) threads = atoi(optarg); break;
         case 1: break;
+        case 2: legacy = 1; break;
         default: usage_find();
         }
     }
@@ -1236,7 +1267,7 @@ static int cmd_find(int argc, char **argv)
     for (c = 0; c < O.nfq; c++) fq_close(&O.fq[c]);
     sam_close(in);
     if (pool) hts_tpool_destroy(pool);
-    print_find_stats(&D, n_unpaired, is_paired, keep_only);
+    print_find_stats(&D, n_unpaired, is_paired, keep_only, phased);
     return 0;
 }
 
@@ -1261,19 +1292,21 @@ static int cmp_i64(const void *a, const void *b)
 static void usage_filter(void)
 {
     fprintf(stderr,
-"usage: hornet filter_remapped_reads [-p] [-t THREADS] to_remap_bam remap_bam keep_bam\n");
+"usage: hornet filter_remapped_reads [-p] [-t THREADS] [--legacy] to_remap_bam remap_bam keep_bam\n");
     exit(2);
 }
 
 static int cmd_filter(int argc, char **argv)
 {
     static struct option lo[] = {
-        {"threads", required_argument, 0, 't'}, {"help", no_argument, 0, 'h'}, {0, 0, 0, 0}};
+        {"threads", required_argument, 0, 't'}, {"legacy", no_argument, 0, 2},
+        {"help", no_argument, 0, 'h'}, {0, 0, 0, 0}};
     int c, is_paired = 0, threads = 4;
     while ((c = getopt_long(argc, argv, "pt:h", lo, NULL)) >= 0) {
         switch (c) {
         case 'p': is_paired = 1; break;
         case 't': threads = atoi(optarg); break;
+        case 2: legacy = 1; break;
         default: usage_filter();
         }
     }
@@ -1370,7 +1403,9 @@ static int cmd_filter(int argc, char **argv)
                         die("ValueError: File ended unexpectedly (no pair found).");
                     bam_out(keep, h1, orig);
                 }
-            } else {
+            } else if (is_paired || legacy) {
+                /* skip the mate of the discarded read (the original also did
+                 * this for single-end data, dropping the next read) */
                 if (sam_read1(to_remap, h1, second) < 0) { end_of_file = 1; break; }
             }
             if (sam_read1(to_remap, h1, orig) < 0) {

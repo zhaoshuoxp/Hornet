@@ -1,6 +1,8 @@
 #!/bin/bash
-# Check that the optimised Python scripts and the C binary produce exactly the
-# same output as the original Hornet code (upstream commit e642ac0).
+# 1. With --legacy, the optimised Python scripts and the C binary must produce
+#    exactly the same output as the original Hornet code (upstream e642ac0).
+# 2. By default (bugs fixed) Python and C must agree with each other, and the
+#    differences from the original must be exactly the intended fixes.
 #
 #   tests/run_equivalence.sh [workdir]
 #
@@ -69,8 +71,8 @@ done | sed 's/$/\r/' | gzip > data_c/snps/all.txt.gz
 ln -sf "$WORK/data_a/pe.bam" data_c/pe.bam; ln -sf "$WORK/data_a/se.bam" data_c/se.bam
 
 PYFIS="python3 $REPO/mapping/find_intersecting_snps.py"
-impls=("python:$PYFIS")
-[ -n "$HORNET_C" ] && impls+=("C:$HORNET_C find_intersecting_snps")
+impls=("python:$PYFIS --legacy")
+[ -n "$HORNET_C" ] && impls+=("C:$HORNET_C find_intersecting_snps --legacy")
 
 for impl in "${impls[@]}"; do
     name=${impl%%:*}; cmd=${impl#*:}
@@ -89,7 +91,7 @@ for impl in "${impls[@]}"; do
 done
 for B in pe.sorted.bam se.sorted.bam; do
     F="-p"; [ $B = se.sorted.bam ] && F=""
-    check "python find_intersecting_snps -j 8 data_b/$B" fis "$WORK/data_b" $B "$F" pyj $PYFIS -j 8
+    check "python find_intersecting_snps -j 8 data_b/$B" fis "$WORK/data_b" $B "$F" pyj $PYFIS --legacy -j 8
 done
 
 # filter_remapped_reads
@@ -99,11 +101,90 @@ for mode in pe se; do
     if [ $mode = pe ]; then fq="$R/pe.sorted.remap.fq1.gz $R/pe.sorted.remap.fq2.gz"; else fq="$R/se.sorted.remap.fq.gz"; fi
     python3 "$HERE/sim_remap.py" "$D/$mode.sorted.bam" "$D/$mode.remap.bam" 3 $fq
     python3 "$WORK/orig/filter_remapped_reads.py" $P "$R/$mode.sorted.to.remap.bam" "$D/$mode.remap.bam" "$D/f.orig.bam" 2> "$D/f.orig.err"
-    python3 "$REPO/mapping/filter_remapped_reads.py" $P "$R/$mode.sorted.to.remap.bam" "$D/$mode.remap.bam" "$D/f.py.bam" 2> "$D/f.py.err"
+    python3 "$REPO/mapping/filter_remapped_reads.py" --legacy $P "$R/$mode.sorted.to.remap.bam" "$D/$mode.remap.bam" "$D/f.py.bam" 2> "$D/f.py.err"
     check "python filter_remapped_reads $mode" eval 'same_bam "$D/f.orig.bam" "$D/f.py.bam" && cmp -s <(stats "$D/f.orig.err") <(stats "$D/f.py.err")'
     if [ -n "$HORNET_C" ]; then
-        "$HORNET_C" filter_remapped_reads $P "$R/$mode.sorted.to.remap.bam" "$D/$mode.remap.bam" "$D/f.c.bam" 2> "$D/f.c.err"
+        "$HORNET_C" filter_remapped_reads --legacy $P "$R/$mode.sorted.to.remap.bam" "$D/$mode.remap.bam" "$D/f.c.bam" 2> "$D/f.c.err"
         check "C filter_remapped_reads $mode" eval 'same_bam "$D/f.orig.bam" "$D/f.c.bam" && cmp -s <(stats "$D/f.orig.err") <(stats "$D/f.c.err")'
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# Default (fixed) behaviour
+# ---------------------------------------------------------------------------
+fis_fixed() { # data bam "flags"
+    local D=$1 B=$2 F=$3
+    local b=${B%.*} W=$D/fixed_$(echo "$B $F" | tr -c 'a-zA-Z0-9\n' '_') x
+    rm -rf "$W"; mkdir -p "$W/orig" "$W/py" "$W/c"
+    for x in orig py c; do
+        ln -s "$D/$B" "$W/$x/$B"
+        [ -e "$D/$B.bai" ] && ln -s "$D/$B.bai" "$W/$x/$B.bai"
+    done
+    (cd "$W/orig" && python3 "$WORK/orig/find_intersecting_snps.py" $F $B "$D/snps" > stdout 2> stderr)
+    (cd "$W/py" && $PYFIS $F $B "$D/snps" > stdout 2> stderr)
+    local impl=py
+    if [ -n "$HORNET_C" ]; then
+        (cd "$W/c" && "$HORNET_C" find_intersecting_snps $F $B "$D/snps" > stdout 2> stderr)
+        impl="py c"
+    fi
+    local ok=0 fq
+    for x in $impl; do
+        for f in keep.bam to.remap.bam dropped.bam; do same_bam "$W/orig/$b.$f" "$W/$x/$b.$f" || ok=1; done
+        # remap fastqs: only the qualities of reverse-strand reads change
+        if [ -e "$W/orig/$b.remap.fq1.gz" ]; then
+            python3 "$HERE/check_fastq_quals.py" "$W/orig/$b.to.remap.bam" \
+                "$W/orig/$b.remap.fq1.gz" "$W/$x/$b.remap.fq1.gz" \
+                "$W/orig/$b.remap.fq2.gz" "$W/$x/$b.remap.fq2.gz" > /dev/null || ok=1
+        else
+            python3 "$HERE/check_fastq_quals.py" "$W/orig/$b.to.remap.bam" \
+                "$W/orig/$b.remap.fq.gz" "$W/$x/$b.remap.fq.gz" > /dev/null || ok=1
+        fi
+        stats "$W/$x/stdout" > "$W/$x.txt"
+    done
+    stats "$W/orig/stdout" > "$W/orig.txt"
+    if [ -n "$HORNET_C" ]; then
+        for fq in "$W"/py/*.fq*.gz; do same_gz "$fq" "$W/c/$(basename "$fq")" || ok=1; done
+        cmp -s "$W/py.txt" "$W/c.txt" || ok=1
+    fi
+    if echo "$F" | grep -q -- -P; then
+        # phased statistics are now counted (the original divided by zero)
+        grep -q "Total SNPs covered: 0$" "$W/py.txt" && ok=1
+        grep -q "non ref/alt base" "$W/py.txt" || ok=1
+    else
+        cmp -s "$W/orig.txt" "$W/py.txt" || ok=1
+    fi
+    return $ok
+}
+for D in data_a data_b; do
+    for B in pe.bam pe.sorted.bam; do
+        check "fixed find_intersecting_snps $D/$B -p"    fis_fixed "$WORK/$D" $B "-p"
+        check "fixed find_intersecting_snps $D/$B -p -P" fis_fixed "$WORK/$D" $B "-p -P"
+    done
+    check "fixed find_intersecting_snps $D/se.bam"       fis_fixed "$WORK/$D" se.bam ""
+done
+check "fixed find_intersecting_snps -j 8 (python) = serial" eval '
+    W=$WORK/data_b/fixed_j; rm -rf $W; mkdir -p $W; ln -s $WORK/data_b/pe.sorted.bam* $W/;
+    (cd $W && $PYFIS -p -j 8 pe.sorted.bam $WORK/data_b/snps > stdout 2>&1) &&
+    S=$WORK/data_b/fixed_pe_sorted_bam__p/py &&
+    same_bam $S/pe.sorted.keep.bam $W/pe.sorted.keep.bam &&
+    same_bam $S/pe.sorted.to.remap.bam $W/pe.sorted.to.remap.bam &&
+    same_gz $S/pe.sorted.remap.fq1.gz $W/pe.sorted.remap.fq1.gz &&
+    same_gz $S/pe.sorted.remap.fq2.gz $W/pe.sorted.remap.fq2.gz'
+
+# filter_remapped_reads: compare with a straightforward reference implementation
+for mode in pe se; do
+    D=$WORK/data_b; P=-p; [ $mode = se ] && P=""
+    R=$(cat "$D/last_orig_$mode.sorted$( [ -n "$P" ] && echo "$P" | tr -c 'a-zA-Z0-9\n' '_')")
+    python3 "$HERE/ref_filter.py" $P "$R/$mode.sorted.to.remap.bam" "$D/$mode.remap.bam" "$D/f.ref.sam"
+    python3 "$REPO/mapping/filter_remapped_reads.py" $P "$R/$mode.sorted.to.remap.bam" "$D/$mode.remap.bam" "$D/f.pyfix.bam" 2> "$D/f.pyfix.err"
+    check "fixed python filter_remapped_reads $mode = reference" same_bam "$D/f.ref.sam" "$D/f.pyfix.bam"
+    if [ -n "$HORNET_C" ]; then
+        "$HORNET_C" filter_remapped_reads $P "$R/$mode.sorted.to.remap.bam" "$D/$mode.remap.bam" "$D/f.cfix.bam" 2> "$D/f.cfix.err"
+        check "fixed C filter_remapped_reads $mode = reference" eval 'same_bam "$D/f.ref.sam" "$D/f.cfix.bam" && cmp -s <(stats "$D/f.pyfix.err") <(stats "$D/f.cfix.err")'
+    fi
+    if [ $mode = pe ]; then
+        python3 "$WORK/orig/filter_remapped_reads.py" -p "$R/$mode.sorted.to.remap.bam" "$D/$mode.remap.bam" "$D/f.orig.pe.bam" 2> /dev/null
+        check "fixed filter_remapped_reads pe = original" same_bam "$D/f.orig.pe.bam" "$D/f.pyfix.bam"
     fi
 done
 

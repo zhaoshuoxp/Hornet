@@ -84,7 +84,8 @@ def _remapped_ok(remap_bam, is_paired_end):
     return correct_maps, nums
 
 
-def run(to_remap_bam, remap_bam, keep_bam, is_paired_end, threads=1):
+def run(to_remap_bam, remap_bam, keep_bam, is_paired_end, threads=1,
+        legacy=False):
     """Core function."""
 
     sys.stderr.write(
@@ -150,7 +151,10 @@ def run(to_remap_bam, remap_bam, keep_bam, is_paired_end, threads=1):
                             "File ended unexpectedly (no pair found)."
                         )
                     keep_write(orig_read)
-            else:
+            elif is_paired_end or legacy:
+                # Skip the mate of the discarded read.  (The original code
+                # also did this for single-end data, silently dropping the
+                # read that follows every discarded read: --legacy.)
                 try:
                     second_read = next(to_remap_bam)
                 except:
@@ -203,6 +207,10 @@ def main():
                                              'paired-end (default is single).'))
     parser.add_argument("-t", "--threads", type=int, default=4,
                         help='Threads for BAM (de)compression (default: 4)')
+    parser.add_argument("--legacy", action='store_true', default=False,
+                        help=('Reproduce the original Hornet output exactly, '
+                              'including its single-end bug (the read after '
+                              'each discarded read was skipped).'))
     h = ('to.remap.bam file from find_intersecting_snps.py.')
     parser.add_argument("to_remap_bam", help=h)
     parser.add_argument("remap_bam", help='Remapped bam file.')
@@ -213,7 +221,7 @@ def main():
     options = parser.parse_args()
 
     run(options.to_remap_bam, options.remap_bam, options.keep_bam,
-        options.is_paired_end, options.threads)
+        options.is_paired_end, options.threads, options.legacy)
 
 if __name__ == '__main__':
     main()
