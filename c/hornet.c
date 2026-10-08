@@ -11,8 +11,6 @@
  * Usage:
  *   hornet find_intersecting_snps [-p] [-P] [-C chrom] [-t threads] in.bam snp_dir
  *   hornet filter_remapped_reads  [-p] [-t threads] to.remap.bam remap.bam keep.bam
- *   hornet rmdup    [-t threads] [--seed N] in.bam out.bam
- *   hornet rmdup_pe [-t threads] [--seed N] in.bam out.bam
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -34,8 +32,17 @@
 #include <htslib/bgzf.h>
 #include <htslib/thread_pool.h>
 #include <htslib/khash.h>
+#include <htslib/vcf.h>
 
-#define MAX_SEQS_PER_READ 32
+/* Maximum number of allelic combinations (including the original) per read
+ * or pair: --max-seqs, 32 in --legacy mode as in the original code. */
+static int max_seqs = 64;
+#define MAX_SEQS_PER_READ max_seqs
+
+/* Reads dropped first (default mode): unmapped, secondary, QC-fail,
+ * supplementary; for pairs also reads whose mate is unmapped. */
+#define FLAG_DROP_SINGLE (BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FSUPPLEMENTARY)
+#define FLAG_DROP_PAIRED (FLAG_DROP_SINGLE | BAM_FMUNMAP)
 
 /* --legacy: reproduce the original Hornet output exactly, including its bugs
  * (phased-mode statistics, qualities of reverse-strand reads in the remap
@@ -338,7 +345,10 @@ static int snptab_allele(snptab_t *T, const char *s)
     T->alen[T->na] = (int)strlen(s);
     /* ('-' in alleles) or (max(len(i) for i in alleles) > 1): the second
      * test iterates over characters and is never true. */
-    T->is_indel[T->na] = strchr(s, '-') != NULL;
+    if (legacy)
+        T->is_indel[T->na] = strchr(s, '-') != NULL;
+    else  /* like WASP: anything but single-base ref and alt */
+        T->is_indel[T->na] = strchr(s, '-') != NULL || T->alen[T->na] != 2;
     k = kh_put(s2i, T->aidx, T->alleles[T->na], &ret);
     kh_val(T->aidx, k) = T->na;
     return T->na++;
@@ -565,6 +575,109 @@ static snptab_t *get_snps(const char *snpdir, const char *chrom_only, int nthrea
     return T;
 }
 
+
+/* Heterozygous sites of one sample from a VCF/BCF. SNVs store the sample's
+ * two alleles; every reference base covered by a heterozygous indel or other
+ * non-SNV allele is an indel site ("-"), which wins over SNVs at the same
+ * base. Homozygous and missing genotypes are ignored. */
+typedef struct { sortrec_t *r; int64_t n, m; } recvec_t;
+
+static int is_acgt(const char *a)
+{
+    return a[0] && !a[1] && (a[0] == 'A' || a[0] == 'C' || a[0] == 'G' || a[0] == 'T');
+}
+
+static snptab_t *get_snps_vcf(const char *vcf, const char *sample, const char *chrom_only)
+{
+    htsFile *fp = bcf_open(vcf, "r");
+    if (!fp) die("cannot open %s", vcf);
+    bcf_hdr_t *h = bcf_hdr_read(fp);
+    if (!h) die("cannot read header of %s", vcf);
+    int ns = bcf_hdr_nsamples(h);
+    if (!sample) {
+        if (ns != 1) die("%s has %d samples; choose one with --sample", vcf, ns);
+        sample = h->samples[0];
+    } else if (bcf_hdr_id2int(h, BCF_DT_SAMPLE, sample) < 0) {
+        die("sample %s not found in %s", sample, vcf);
+    }
+    char *smp = xstrdup(sample);
+    if (bcf_hdr_set_samples(h, smp, 0) != 0) die("cannot select sample %s", smp);
+    printf("%s .... Loading heterozygous sites of sample %s from %s\n", now_str(), smp, vcf);
+    fflush(stdout);
+
+    snptab_t *T = calloc(1, sizeof *T);
+    T->idx = kh_init(s2i);
+    T->aidx = kh_init(s2i);
+    int indel_code = snptab_allele(T, "-");
+    recvec_t *vec = NULL;
+    int nvec = 0;
+    int32_t *gt = NULL;
+    int ngt_arr = 0;
+    int64_t order = 0;
+    const int64_t INDEL_ORDER = (int64_t)1 << 40;
+    bcf1_t *rec = bcf_init();
+    int ret;
+    while ((ret = bcf_read(fp, h, rec)) == 0) {
+        const char *chrom = bcf_seqname(h, rec);
+        if (chrom_only && strcmp(chrom, chrom_only) != 0) continue;
+        int ngt = bcf_get_genotypes(h, rec, &gt, &ngt_arr);
+        if (ngt != 2) continue;
+        if (bcf_gt_is_missing(gt[0]) || gt[1] == bcf_int32_vector_end || bcf_gt_is_missing(gt[1]))
+            continue;
+        int a = bcf_gt_allele(gt[0]), b = bcf_gt_allele(gt[1]);
+        if (a == b) continue;
+        if (a > b) { int t = a; a = b; b = t; }
+        bcf_unpack(rec, BCF_UN_STR);
+        if (b >= rec->n_allele) continue;
+        int ci = snptab_chrom(T, chrom, 1);
+        if (ci >= nvec) {
+            vec = xrealloc(vec, sizeof(recvec_t) * (ci + 1));
+            memset(vec + nvec, 0, sizeof(recvec_t) * (ci + 1 - nvec));
+            nvec = ci + 1;
+        }
+        recvec_t *V = &vec[ci];
+        const char *A = rec->d.allele[a], *B = rec->d.allele[b];
+        if (is_acgt(A) && is_acgt(B)) {
+            char al[3] = { A[0], B[0], 0 };
+            GROW(V->r, V->n, V->m);
+            V->r[V->n].pos = rec->pos;
+            V->r[V->n].order = order++;
+            V->r[V->n].code = (uint32_t)snptab_allele(T, al);
+            V->n++;
+        } else {
+            int64_t p, end = rec->pos + (rec->rlen > 0 ? rec->rlen : 1);
+            for (p = rec->pos; p < end; p++) {
+                GROW(V->r, V->n, V->m);
+                V->r[V->n].pos = p;
+                V->r[V->n].order = INDEL_ORDER + order++;
+                V->r[V->n].code = (uint32_t)indel_code;
+                V->n++;
+            }
+        }
+    }
+    if (ret < -1) die("error reading %s", vcf);
+    int c;
+    for (c = 0; c < nvec; c++) {
+        if (vec[c].n) {
+            qsort(vec[c].r, vec[c].n, sizeof(sortrec_t), cmp_sortrec);
+            finalize_chrom(&T->snps[c], vec[c].r, vec[c].n);
+        }
+        free(vec[c].r);
+    }
+    free(vec);
+    free(gt);
+    bcf_destroy(rec);
+    bcf_hdr_destroy(h);
+    bcf_close(fp);
+    if (T->n == 0) {
+        printf("ERROR: no heterozygous sites found for sample %s\n", smp);
+        fflush(stdout);
+        exit(1);
+    }
+    free(smp);
+    return T;
+}
+
 /* ------------------------------------------------------------------------ */
 /* find_intersecting_snps                                                   */
 /* ------------------------------------------------------------------------ */
@@ -572,7 +685,7 @@ static snptab_t *get_snps(const char *snpdir, const char *chrom_only, int nthrea
 typedef struct {
     int64_t total, skipped, no_snps, has_snps, total_snps, ref_match, no_match,
             toss_indel, toss_manysnps, toss_anomalous_phase, not_proper_pair,
-            unmapped, non_refalt_base;
+            unmapped, non_refalt_base, flagged;
 } counts_t;
 
 typedef struct {
@@ -685,6 +798,61 @@ static inline char seq_at(seqset_t *S, int which, int64_t pos, const bam1_t *b)
         die("read %s: string index out of range (IndexError in the Python version)",
             bam_get_qname(b));
     return ss_get(S, which)[pos];
+}
+
+/* Single-end allelic versions (default mode): drop reads overlapping an
+ * indel, then reads with more than max_seqs combinations. Unphased: every
+ * combination of the alleles; phased: every SNP switched to the other
+ * allele. Returns the number of sequences (0: drop, 1: keep). */
+static int single_read_seqs_checked(const bam1_t *b, sites_t *ST, const snptab_t *T,
+                                    counts_t *D, int phased, seqset_t *S)
+{
+    int k, a, j;
+    int64_t prod = 1;
+    for (k = 0; k < ST->n; k++)
+        if (T->is_indel[ST->s[k].code]) { D->toss_indel++; return 0; }
+    for (k = 0; k < ST->n; k++) {
+        prod *= T->alen[ST->s[k].code];
+        if (prod > max_seqs) { D->toss_manysnps++; return 0; }
+    }
+    ss_init_read(S, b);
+    if (phased) {
+        int n1 = ss_push_copy(S, 0);
+        for (k = 0; k < ST->n; k++) {
+            site_t *s = &ST->s[k];
+            const char *al = T->alleles[s->code];
+            int alen = T->alen[s->code];
+            D->total_snps++;
+            const char *f = memchr(al, seq_at(S, 0, s->qpos, b), alen);
+            if (!f) { D->no_match++; D->non_refalt_base++; return 0; }
+            D->ref_match++;
+            ss_get(S, n1)[s->qpos] = al[1 - (f - al)];
+        }
+        D->has_snps++;
+        return 2;
+    }
+    for (k = 0; k < ST->n; k++) {
+        site_t *s = &ST->s[k];
+        const char *al = T->alleles[s->code];
+        int alen = T->alen[s->code];
+        char rb = seq_at(S, 0, s->qpos, b);
+        D->total_snps++;
+        if (memchr(al, rb, alen)) {
+            D->ref_match++;
+            for (a = 0; a < alen; a++) {
+                if (al[a] == rb) continue;
+                int cur = S->n;
+                for (j = 0; j < cur; j++) {
+                    int t = ss_push_copy(S, j);
+                    ss_get(S, t)[s->qpos] = al[a];
+                }
+            }
+        } else {
+            D->no_match++;
+        }
+    }
+    if (S->n == 1) D->no_snps++; else D->has_snps++;
+    return S->n;
 }
 
 /* get_read_seqs(): returns number of sequences (0: drop, 1: keep) */
@@ -1048,6 +1216,11 @@ static void print_find_stats(counts_t *R, int64_t n_unpaired, int is_paired, con
         printf("  Total input reads: %lld\n", (long long)total_pairs);
     }
     if (keep_only) printf("  Reads on skipped chromosomes %lld\n", (long long)R->skipped);
+    if (!legacy) {
+        fmt_pct(p, R->flagged, total_pairs);
+        printf("  Reads dropped [unmapped/secondary/supplementary/QC-fail%s]: %lld (%s%%)\n",
+               is_paired ? "/mate unmapped" : "", (long long)R->flagged, p);
+    }
     fmt_pct(p, R->no_snps, total_pairs);
     printf("  Reads with no SNPs: %lld (%s%%)\n", (long long)R->no_snps, p);
     fmt_pct(p, R->has_snps, total_pairs);
@@ -1065,11 +1238,13 @@ static void print_find_stats(counts_t *R, int64_t n_unpaired, int is_paired, con
         fmt_pct(p, R->toss_anomalous_phase, total_pairs);
         printf("  Reads dropped [anomalous pair]: %lld (%s%%)\n",
                (long long)R->toss_anomalous_phase, p);
-        if (phased && !legacy) {
-            fmt_pct(p, R->non_refalt_base, total_pairs);
-            printf("  Reads dropped [non ref/alt base]: %lld (%s%%)\n",
-                   (long long)R->non_refalt_base, p);
-        }
+    }
+    if (phased && !legacy) {
+        fmt_pct(p, R->non_refalt_base, total_pairs);
+        printf("  Reads dropped [non ref/alt base]: %lld (%s%%)\n",
+               (long long)R->non_refalt_base, p);
+    }
+    if (is_paired) {
         fmt_pct(p, R->not_proper_pair, total_pairs);
         printf("  Reads dropped [not proper pair]: %lld (%s%%)\n",
                (long long)R->not_proper_pair, p);
@@ -1086,14 +1261,20 @@ static void bp_put(bpool_t *p, bam1_t *b) { GROW(p->b, p->n, p->m); p->b[p->n++]
 static void usage_find(void)
 {
     fprintf(stderr,
-"usage: hornet find_intersecting_snps [-p] [-C CHROM] [-s] [-P] [-t THREADS] [--legacy] infile snp_dir\n"
+"usage: hornet find_intersecting_snps [options] infile snp_dir\n"
+"       hornet find_intersecting_snps [options] --vcf FILE [--sample NAME] infile\n"
 "  -p, --paired_end        reads are paired-end (default is single)\n"
 "  -C, --limit-to-chrom    limit loading of SNPs to the specified chromosome\n"
 "  -s, --sorted            input is coordinate sorted (accepted, unused)\n"
-"  -P, --phased-snp-data   SNP data is phased\n"
+"  -P, --phased-snp-data   SNPs are phased (e.g. F1 hybrid): one swapped read per read\n"
 "  -t, --threads           threads for BAM/fastq (de)compression and SNP loading (default 4)\n"
 "      --progressbar       accepted for compatibility (ignored)\n"
-"      --legacy            reproduce the original output exactly, bugs included\n");
+"      --vcf FILE          use the heterozygous sites of a sample in a VCF/BCF\n"
+"      --sample NAME       sample in --vcf (default: the only sample)\n"
+"      --max-seqs N        drop reads (pairs) with more than N allelic combinations\n"
+"                          (default 64, i.e. at most 6 SNPs)\n"
+"      --legacy            reproduce the original output exactly, bugs included\n"
+"                          (no read flag filters, --max-seqs 32)\n");
     exit(2);
 }
 
@@ -1108,10 +1289,13 @@ static int cmd_find(int argc, char **argv)
         {"threads", required_argument, 0, 't'},
         {"processes", required_argument, 0, 'j'},
         {"legacy", no_argument, 0, 2},
+        {"vcf", required_argument, 0, 3},
+        {"sample", required_argument, 0, 4},
+        {"max-seqs", required_argument, 0, 5},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}};
-    int c, is_paired = 0, phased = 0, threads = 4;
-    const char *keep_only = NULL;
+    int c, is_paired = 0, phased = 0, threads = 4, max_seqs_set = 0;
+    const char *keep_only = NULL, *vcf = NULL, *sample = NULL;
     while ((c = getopt_long(argc, argv, "pC:sPt:j:h", lo, NULL)) >= 0) {
         switch (c) {
         case 'p': is_paired = 1; break;
@@ -1122,19 +1306,30 @@ static int cmd_find(int argc, char **argv)
         case 'j': if (atoi(optarg) > threads) threads = atoi(optarg); break;
         case 1: break;
         case 2: legacy = 1; break;
+        case 3: vcf = optarg; break;
+        case 4: sample = optarg; break;
+        case 5:
+            max_seqs = atoi(optarg);
+            max_seqs_set = 1;
+            if (max_seqs < 1) die("--max-seqs must be >= 1");
+            break;
         default: usage_find();
         }
     }
-    if (argc - optind != 2) usage_find();
-    const char *infile = argv[optind], *snpdir = argv[optind + 1];
+    if (argc - optind != (vcf ? 1 : 2)) usage_find();
+    const char *infile = argv[optind], *snpdir = vcf ? NULL : argv[optind + 1];
     if (threads < 1) threads = 1;
+    if (legacy) {
+        if (vcf || max_seqs_set) die("--legacy cannot be combined with --vcf or --max-seqs");
+        max_seqs = 32;
+    }
 
     samFile *in = sam_open(infile, "r");
     if (!in) die("cannot open %s", infile);
     sam_hdr_t *hdr = sam_hdr_read(in);
     if (!hdr) die("cannot read header of %s", infile);
 
-    snptab_t *T = get_snps(snpdir, keep_only, threads);
+    snptab_t *T = vcf ? get_snps_vcf(vcf, sample, keep_only) : get_snps(snpdir, keep_only, threads);
     printf("%s .... Done with SNPs.\n", now_str());
     fflush(stdout);
 
@@ -1196,20 +1391,30 @@ static int cmd_find(int argc, char **argv)
         }
         D.total++;
         if (!is_paired) {
-            if (phased) die("NotImplementedError: Not yet implemented. It should work with paired end reads, though");
+            if (legacy) {
+                if (phased) die("NotImplementedError: Not yet implemented. It should work with paired end reads, though");
+            } else if (b->core.flag & FLAG_DROP_SINGLE) {
+                D.flagged++;
+                continue;
+            }
             find_sites(b, tid >= 0 ? tabs[tid] : NULL, &S1);
             if (S1.n == 0) {
                 D.no_snps++;
                 bam_out(O.keep, hdr, b);
                 continue;
             }
-            int ns = single_read_seqs(b, &S1, T, &D, &Q1);
+            int ns = legacy ? single_read_seqs(b, &S1, T, &D, &Q1)
+                            : single_read_seqs_checked(b, &S1, T, &D, phased, &Q1);
             const bam1_t *rr[1] = { b };
             seqset_t *qq[1] = { &Q1 };
             write_seqs(&O, rr, qq, 1, ns);
             continue;
         }
         uint16_t flag = b->core.flag;
+        if (!legacy) {
+            if (flag & FLAG_DROP_PAIRED) { D.flagged++; continue; }
+            if (b->core.mtid != tid) { D.not_proper_pair++; continue; }
+        }
         if (!(flag & BAM_FPROPER_PAIR)) { D.not_proper_pair++; continue; }
         int slot_self = (flag & BAM_FREAD2) ? 1 : 0;
         int slot_other = (flag & BAM_FREAD1) ? 1 : 0;
@@ -1292,8 +1497,145 @@ static int cmp_i64(const void *a, const void *b)
 static void usage_filter(void)
 {
     fprintf(stderr,
-"usage: hornet filter_remapped_reads [-p] [-t THREADS] [--legacy] to_remap_bam remap_bam keep_bam\n");
+"usage: hornet filter_remapped_reads [-p] [-t THREADS] [--legacy] to_remap_bam remap_bam keep_bam\n"
+"  remap_bam can be in any order (--legacy: original algorithm, needs a name-sorted BAM)\n");
     exit(2);
+}
+
+
+/* WASP-like filter (default). For each remapped record of a read (pair):
+ * no secondary/supplementary alignment (any discards the read), same
+ * chromosome, start, strand and CIGAR (hard clips ignored) as the original,
+ * for pairs a proper pair with the mate at the original mate position; the
+ * number of such records must equal the number of versions written (times
+ * two for pairs). The remapped BAM can be in any order. */
+static uint64_t cigar_key(const bam1_t *b)
+{
+    uint64_t h = 1469598103934665603ULL;
+    const uint32_t *c = bam_get_cigar(b);
+    uint32_t k;
+    for (k = 0; k < b->core.n_cigar; k++) {
+        if (bam_cigar_op(c[k]) == BAM_CHARD_CLIP) continue;
+        h = (h ^ c[k]) * 1099511628211ULL;
+    }
+    return h;
+}
+
+static int filter_strict(const char *to_remap_path, const char *remap_path,
+                         const char *keep_path, int is_paired, hts_tpool *pool)
+{
+    htsThreadPool tp = { pool, 0 };
+    int n = is_paired ? 2 : 1, ret;
+    int64_t k = 0, nid, i;
+    bam1_t *b = bam_init1();
+
+    /* pass 1: original reads, n per remap ID */
+    samFile *fp = sam_open(to_remap_path, "r");
+    if (!fp) die("cannot open %s", to_remap_path);
+    if (pool) hts_set_opt(fp, HTS_OPT_THREAD_POOL, &tp);
+    sam_hdr_t *h1 = sam_hdr_read(fp);
+    if (!h1) die("cannot read header of %s", to_remap_path);
+    int32_t *otid = NULL;
+    int64_t *opos = NULL;
+    uint8_t *orev = NULL;
+    uint64_t *ocig = NULL;
+    int64_t m = 0;
+    while ((ret = sam_read1(fp, h1, b)) >= 0) {
+        int64_t j = k + n;   /* index (id * n + mate), ids start at 1 */
+        if (j + n > m) {
+            m = m ? m * 2 : 1 << 16;
+            while (m < j + n) m *= 2;
+            otid = xrealloc(otid, sizeof(int32_t) * (m / n + 1));
+            opos = xrealloc(opos, sizeof(int64_t) * m);
+            orev = xrealloc(orev, m);
+            ocig = xrealloc(ocig, sizeof(uint64_t) * m);
+        }
+        if (k % n == 0) otid[k / n + 1] = b->core.tid;
+        opos[j] = b->core.pos;
+        orev[j] = (b->core.flag & BAM_FREVERSE) ? 1 : 0;
+        ocig[j] = cigar_key(b);
+        k++;
+    }
+    if (ret < -1) die("error reading %s", to_remap_path);
+    if (k % n) die("%s has an odd number of reads", to_remap_path);
+    nid = k / n;
+    sam_close(fp);
+
+    /* pass 2: remapped reads */
+    samFile *rp = sam_open(remap_path, "r");
+    if (!rp) die("cannot open %s", remap_path);
+    if (pool) hts_set_opt(rp, HTS_OPT_THREAD_POOL, &tp);
+    sam_hdr_t *h2 = sam_hdr_read(rp);
+    if (!h2) die("cannot read header of %s", remap_path);
+    int nref2 = sam_hdr_nref(h2), t;
+    int *tidmap = xmalloc(sizeof(int) * (nref2 + 1));
+    for (t = 0; t < nref2; t++) {
+        tidmap[t] = sam_hdr_name2tid(h1, sam_hdr_tid2name(h2, t));
+        if (tidmap[t] < 0) tidmap[t] = -2;
+    }
+    int32_t *expected = calloc(nid + 1, sizeof(int32_t));
+    int32_t *correct = calloc(nid + 1, sizeof(int32_t));
+    uint8_t *moved = calloc(nid + 1, 1), *multi = calloc(nid + 1, 1);
+    char tok[64];
+    while ((ret = sam_read1(rp, h2, b)) >= 0) {
+        const char *q = bam_get_qname(b);
+        const char *c1 = strchr(q, ':'), *cl = strrchr(q, ':');
+        int64_t rid, num;
+        size_t l;
+        if (!c1) die("unexpected read name %s in %s (not from find_intersecting_snps?)", q, remap_path);
+        l = c1 - q;
+        if (l >= sizeof tok) die("unexpected read name %s", q);
+        memcpy(tok, q, l); tok[l] = 0;
+        if (parse_pyint(tok, &rid) < 0) die("unexpected read name %s in %s (not from find_intersecting_snps?)", q, remap_path);
+        l = strcspn(cl + 1, "/");
+        if (l >= sizeof tok) die("unexpected read name %s", q);
+        memcpy(tok, cl + 1, l); tok[l] = 0;
+        if (parse_pyint(tok, &num) < 0) die("unexpected read name %s in %s (not from find_intersecting_snps?)", q, remap_path);
+        if (rid < 1 || rid > nid) die("read %s has no counterpart in %s", q, to_remap_path);
+        expected[rid] = (int32_t)(num * n);
+        uint16_t flag = b->core.flag;
+        if (flag & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY)) { multi[rid] = 1; continue; }
+        if (flag & BAM_FUNMAP) continue;
+        int mate = (n == 2 && (flag & BAM_FREAD2)) ? 1 : 0;
+        int64_t j = rid * n + mate;
+        int tid = b->core.tid >= 0 ? tidmap[b->core.tid] : -3;
+        int ok = tid == otid[rid] && b->core.pos == opos[j] &&
+                 ((flag & BAM_FREVERSE) ? 1 : 0) == orev[j] && cigar_key(b) == ocig[j];
+        if (ok && n == 2)
+            ok = (flag & BAM_FPROPER_PAIR) && !(flag & BAM_FMUNMAP) && b->core.mtid >= 0 &&
+                 tidmap[b->core.mtid] == tid && b->core.mpos == opos[rid * n + 1 - mate];
+        if (ok) correct[rid]++; else moved[rid] = 1;
+    }
+    if (ret < -1) die("error reading %s", remap_path);
+    sam_close(rp);
+
+    /* pass 3: write kept reads */
+    fp = sam_open(to_remap_path, "r");
+    if (!fp) die("cannot open %s", to_remap_path);
+    if (pool) hts_set_opt(fp, HTS_OPT_THREAD_POOL, &tp);
+    sam_hdr_destroy(h1);
+    h1 = sam_hdr_read(fp);
+    samFile *keep = open_bam_out(keep_path, h1, pool);
+    int64_t n_keep = 0, n_moved = 0, n_multi = 0, n_missing = 0;
+    for (i = 0; sam_read1(fp, h1, b) >= 0; i++) {
+        int64_t rid = i / n + 1;
+        int last = (i + 1) % n == 0;
+        if (multi[rid]) n_multi += last;
+        else if (moved[rid]) n_moved += last;
+        else if (expected[rid] == 0 || correct[rid] != expected[rid]) n_missing += last;
+        else { bam_out(keep, h1, b); n_keep += last; }
+    }
+    if (sam_close(keep) < 0) die("error closing %s", keep_path);
+    sam_close(fp);
+    fprintf(stderr, "%s Finished\n\n", now_str());
+    fprintf(stderr, "RUN STATISTICS:\n\tTotal remapped read (pair)s: %lld\n\t"
+            "Read (pair)s remapped to the correct position: %lld %.2f%%\n"
+            "\tDiscarded, remapped to another position, strand or CIGAR: %lld\n"
+            "\tDiscarded, secondary/supplementary alignments: %lld\n"
+            "\tDiscarded, unmapped or missing remapped reads: %lld\n",
+            (long long)nid, (long long)n_keep, nid ? (double)n_keep / (double)nid * 100 : 0.0,
+            (long long)n_moved, (long long)n_multi, (long long)n_missing);
+    return 0;
 }
 
 static int cmd_filter(int argc, char **argv)
@@ -1315,6 +1657,11 @@ static int cmd_filter(int argc, char **argv)
     fprintf(stderr, "%s Starting run\n", now_str());
 
     hts_tpool *pool = threads > 1 ? hts_tpool_init(threads) : NULL;
+    if (!legacy) {
+        filter_strict(argv[optind], argv[optind + 1], argv[optind + 2], is_paired, pool);
+        if (pool) hts_tpool_destroy(pool);
+        return 0;
+    }
     htsThreadPool tp = { pool, 0 };
     samFile *to_remap = sam_open(argv[optind], "rb");
     if (!to_remap) die("cannot open %s", argv[optind]);
@@ -1446,326 +1793,6 @@ static int cmd_filter(int argc, char **argv)
 }
 
 /* ------------------------------------------------------------------------ */
-/* CPython-compatible Mersenne Twister (random.seed / random.choice)        */
-/* ------------------------------------------------------------------------ */
-
-#define MT_N 624
-#define MT_M 397
-static uint32_t mt[MT_N];
-static int mti = MT_N + 1;
-
-static void init_genrand(uint32_t s)
-{
-    mt[0] = s;
-    for (mti = 1; mti < MT_N; mti++)
-        mt[mti] = (1812433253U * (mt[mti-1] ^ (mt[mti-1] >> 30)) + (uint32_t)mti);
-}
-
-static void init_by_array(const uint32_t *key, size_t keylen)
-{
-    size_t i = 1, j = 0, k;
-    init_genrand(19650218U);
-    k = MT_N > keylen ? MT_N : keylen;
-    for (; k; k--) {
-        mt[i] = (mt[i] ^ ((mt[i-1] ^ (mt[i-1] >> 30)) * 1664525U)) + key[j] + (uint32_t)j;
-        i++; j++;
-        if (i >= MT_N) { mt[0] = mt[MT_N-1]; i = 1; }
-        if (j >= keylen) j = 0;
-    }
-    for (k = MT_N - 1; k; k--) {
-        mt[i] = (mt[i] ^ ((mt[i-1] ^ (mt[i-1] >> 30)) * 1566083941U)) - (uint32_t)i;
-        i++;
-        if (i >= MT_N) { mt[0] = mt[MT_N-1]; i = 1; }
-    }
-    mt[0] = 0x80000000U;
-}
-
-static uint32_t genrand_uint32(void)
-{
-    static const uint32_t mag01[2] = { 0x0U, 0x9908b0dfU };
-    uint32_t y;
-    if (mti >= MT_N) {
-        int kk;
-        for (kk = 0; kk < MT_N - MT_M; kk++) {
-            y = (mt[kk] & 0x80000000U) | (mt[kk+1] & 0x7fffffffU);
-            mt[kk] = mt[kk+MT_M] ^ (y >> 1) ^ mag01[y & 1U];
-        }
-        for (; kk < MT_N - 1; kk++) {
-            y = (mt[kk] & 0x80000000U) | (mt[kk+1] & 0x7fffffffU);
-            mt[kk] = mt[kk+(MT_M-MT_N)] ^ (y >> 1) ^ mag01[y & 1U];
-        }
-        y = (mt[MT_N-1] & 0x80000000U) | (mt[0] & 0x7fffffffU);
-        mt[MT_N-1] = mt[MT_M-1] ^ (y >> 1) ^ mag01[y & 1U];
-        mti = 0;
-    }
-    y = mt[mti++];
-    y ^= (y >> 11);
-    y ^= (y << 7) & 0x9d2c5680U;
-    y ^= (y << 15) & 0xefc60000U;
-    y ^= (y >> 18);
-    return y;
-}
-
-/* random.seed(int): key = 32-bit words of abs(seed) */
-static void py_seed(int64_t seed)
-{
-    uint64_t a = seed < 0 ? (uint64_t)(-(seed + 1)) + 1 : (uint64_t)seed;
-    uint32_t key[2];
-    size_t n = 0;
-    if (a == 0) key[n++] = 0;
-    while (a) { key[n++] = (uint32_t)(a & 0xffffffffU); a >>= 32; }
-    init_by_array(key, n);
-}
-
-static void py_seed_urandom(void)
-{
-    uint32_t key[MT_N];
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0 || read(fd, key, sizeof key) != (ssize_t)sizeof key) {
-        size_t i;
-        for (i = 0; i < MT_N; i++) key[i] = (uint32_t)(time(NULL) ^ (getpid() << 8) ^ i);
-    }
-    if (fd >= 0) close(fd);
-    init_by_array(key, MT_N);
-}
-
-/* Random._randbelow_with_getrandbits(n) for 0 < n < 2**32 */
-static uint64_t py_randbelow(uint64_t n)
-{
-    int k = 0;
-    uint64_t r, t = n;
-    while (t) { k++; t >>= 1; }
-    if (k > 32) die("too many duplicates at one position");
-    do r = genrand_uint32() >> (32 - k); while (r >= n);
-    return r;
-}
-
-/* ------------------------------------------------------------------------ */
-/* rmdup / rmdup_pe                                                         */
-/* ------------------------------------------------------------------------ */
-
-typedef struct { bam1_t **b; int64_t n, m; } blist_t;
-
-static void bl_push(blist_t *l, bam1_t *b) { GROW(l->b, l->n, l->m); l->b[l->n++] = b; }
-
-static int open_dedup_io(int argc, char **argv, samFile **in, samFile **out,
-                         sam_hdr_t **hdr, hts_tpool **pool, const char *name)
-{
-    static struct option lo[] = {
-        {"threads", required_argument, 0, 't'}, {"seed", required_argument, 0, 's'},
-        {"help", no_argument, 0, 'h'}, {0, 0, 0, 0}};
-    int c, threads = 4, seeded = 0;
-    int64_t seed = 0;
-    while ((c = getopt_long(argc, argv, "t:h", lo, NULL)) >= 0) {
-        switch (c) {
-        case 't': threads = atoi(optarg); break;
-        case 's':
-            if (parse_pyint(optarg, &seed) < 0) die("invalid seed");
-            seeded = 1;
-            break;
-        default:
-            fprintf(stderr, "usage: hornet %s [-t THREADS] [--seed N] input_bam output_bam\n", name);
-            exit(2);
-        }
-    }
-    if (argc - optind != 2) {
-        fprintf(stderr, "usage: hornet %s [-t THREADS] [--seed N] input_bam output_bam\n", name);
-        exit(2);
-    }
-    if (seeded) py_seed(seed); else py_seed_urandom();
-    if (threads < 1) threads = 1;
-    const char *ifn = argv[optind], *ofn = argv[optind + 1];
-    *pool = threads > 1 ? hts_tpool_init(threads) : NULL;
-    htsThreadPool tp = { *pool, 0 };
-    *in = sam_open(ifn, "r");
-    if (!*in) die("cannot open %s", ifn);
-    if (*pool) hts_set_opt(*in, HTS_OPT_THREAD_POOL, &tp);
-    *hdr = sam_hdr_read(*in);
-    if (!*hdr) die("cannot read header of %s", ifn);
-    if (has_suffix(ofn, ".sam")) {
-        *out = sam_open(ofn, "w");
-        if (!*out || sam_hdr_write(*out, *hdr) < 0) die("cannot write %s", ofn);
-    } else if (has_suffix(ofn, ".bam")) {
-        *out = open_bam_out(ofn, *hdr, *pool);
-    } else {
-        die("ValueError: name of output file must end with .bam or .sam");
-    }
-    return 0;
-}
-
-static int cmd_rmdup(int argc, char **argv)
-{
-    samFile *in, *out;
-    sam_hdr_t *hdr;
-    hts_tpool *pool;
-    open_dedup_io(argc, argv, &in, &out, &hdr, &pool, "rmdup");
-    blist_t plus = { 0 }, minus = { 0 };
-    bpool_t bp = { 0 };
-    int64_t chr = INT64_MIN, pos = 0, i;
-    int ret;
-    bam1_t *b = bp_get(&bp);
-    while ((ret = sam_read1(in, hdr, b)) >= 0) {
-        if (b->core.tid != chr || b->core.pos != pos) {
-            if (plus.n) bam_out(out, hdr, plus.b[py_randbelow(plus.n)]);
-            if (minus.n) bam_out(out, hdr, minus.b[py_randbelow(minus.n)]);
-            chr = b->core.tid;
-            pos = b->core.pos;
-            for (i = 0; i < plus.n; i++) bp_put(&bp, plus.b[i]);
-            for (i = 0; i < minus.n; i++) bp_put(&bp, minus.b[i]);
-            plus.n = minus.n = 0;
-        }
-        if (b->core.flag == 0) { bl_push(&plus, b); b = bp_get(&bp); }
-        else if (b->core.flag == 16) { bl_push(&minus, b); b = bp_get(&bp); }
-    }
-    if (ret < -1) die("error reading input");
-    /* As in the original, the last group is not written. */
-    sam_close(in);
-    if (sam_close(out) < 0) die("error closing output");
-    if (pool) hts_tpool_destroy(pool);
-    return 0;
-}
-
-KHASH_MAP_INIT_INT64(i2i, int64_t)
-
-typedef struct {
-    blist_t *table;
-    unsigned char *occupied;   /* occupied[i] != 0 iff table[i] is non-empty */
-    int64_t W, num_reads, cur_pos, chr;
-    int has_chr, finished;
-    bam1_t *cur_read;
-    samFile *in, *out;
-    sam_hdr_t *hdr;
-    bpool_t bp;
-    /* scratch for empty_slot */
-    int64_t *keys;
-    blist_t *groups;
-    int64_t nk, mk;
-    khash_t(i2i) *kidx;
-} rfilter_t;
-
-/* Python's % for a positive modulus */
-static inline int64_t pmod(int64_t a, int64_t m) { a %= m; return a < 0 ? a + m : a; }
-
-static void rf_empty_slot(rfilter_t *F)
-{
-    int64_t W = F->W, i, g;
-    int64_t cur_pos = F->cur_pos;
-    blist_t slot = F->table[pmod(cur_pos, W)];
-    int ret;
-    /* ends: mate position -> reads, in insertion order */
-    F->nk = 0;
-    kh_clear(i2i, F->kidx);
-    for (i = 0; i < slot.n; i++) {
-        int64_t mp = slot.b[i]->core.mpos;
-        khint_t k = kh_put(i2i, F->kidx, mp, &ret);
-        if (ret) {
-            if (F->nk >= F->mk) {
-                F->mk = F->mk ? F->mk * 2 : 16;
-                F->keys = xrealloc(F->keys, sizeof(int64_t) * F->mk);
-                F->groups = xrealloc(F->groups, sizeof(blist_t) * F->mk);
-            }
-            F->keys[F->nk] = mp;
-            memset(&F->groups[F->nk], 0, sizeof(blist_t));
-            kh_val(F->kidx, k) = F->nk++;
-        }
-        bl_push(&F->groups[kh_val(F->kidx, k)], slot.b[i]);
-    }
-    F->num_reads -= slot.n;
-    F->table[pmod(cur_pos, W)].n = 0;
-    F->occupied[pmod(cur_pos, W)] = 0;
-
-    for (g = 0; g < F->nk; g++) {
-        blist_t *rl = &F->groups[g];
-        int64_t end_key = F->keys[g];
-        if (end_key < cur_pos) continue;
-        /* mates: first read with the same name in the mate's slot */
-        blist_t *mslot = &F->table[pmod(end_key, W)];
-        khash_t(rd) *names = kh_init(rd);
-        for (i = 0; i < mslot->n; i++) {
-            khint_t k = kh_put(rd, names, bam_get_qname(mslot->b[i]), &ret);
-            if (ret) kh_val(names, k) = mslot->b[i];   /* first one wins */
-        }
-        while (rl->n > 0) {
-            int64_t idx = (int64_t)py_randbelow(rl->n);
-            bam1_t *keep_read = rl->b[idx];
-            memmove(rl->b + idx, rl->b + idx + 1, sizeof(bam1_t *) * (rl->n - idx - 1));
-            rl->n--;
-            khint_t k = kh_get(rd, names, bam_get_qname(keep_read));
-            if (k != kh_end(names)) {
-                bam_out(F->out, F->hdr, keep_read);
-                bam_out(F->out, F->hdr, kh_val(names, k));
-            }
-        }
-        kh_destroy(rd, names);
-    }
-    /* reads of this slot are no longer referenced */
-    for (g = 0; g < F->nk; g++) {
-        free(F->groups[g].b);
-    }
-    for (i = 0; i < slot.n; i++) bp_put(&F->bp, slot.b[i]);
-    if (F->num_reads > 0) {
-        /* while len(table[cur_pos % W]) == 0: cur_pos += 1 */
-        int64_t start = pmod(F->cur_pos, W);
-        unsigned char *p = memchr(F->occupied + start, 1, W - start);
-        int64_t i = p ? p - F->occupied : ((unsigned char *)memchr(F->occupied, 1, start) - F->occupied) + W;
-        F->cur_pos += i - start;
-    }
-}
-
-static void rf_empty_table(rfilter_t *F)
-{
-    while (F->num_reads > 0) rf_empty_slot(F);
-}
-
-static void rf_fill_table(rfilter_t *F)
-{
-    if (!F->has_chr || F->cur_read->core.tid != F->chr) {
-        rf_empty_table(F);
-        F->chr = F->cur_read->core.tid;
-        F->has_chr = 1;
-    }
-    if (F->num_reads == 0) F->cur_pos = F->cur_read->core.pos;
-    int64_t limit = F->cur_pos + F->W;
-    while (!F->finished && F->cur_read->core.tid == F->chr && F->cur_read->core.pos < limit) {
-        int64_t s = pmod(F->cur_read->core.pos, F->W);
-        bl_push(&F->table[s], F->cur_read);
-        F->occupied[s] = 1;
-        F->num_reads++;
-        bam1_t *nb = bp_get(&F->bp);
-        if (sam_read1(F->in, F->hdr, nb) < 0) {
-            bp_put(&F->bp, nb);
-            F->finished = 1;
-        } else {
-            F->cur_read = nb;
-        }
-    }
-}
-
-static int cmd_rmdup_pe(int argc, char **argv)
-{
-    rfilter_t F;
-    hts_tpool *pool;
-    memset(&F, 0, sizeof F);
-    open_dedup_io(argc, argv, &F.in, &F.out, &F.hdr, &pool, "rmdup_pe");
-    fprintf(stderr, "WARNING: rmdup_pe keeps every read pair whose mate is found within its window, so it removes few or no duplicates (original Hornet algorithm, kept for reproducibility). For duplicate removal use Picard MarkDuplicates --REMOVE_DUPLICATES true --DUPLICATE_SCORING_STRATEGY RANDOM, or samtools markdup -r.\n");
-    F.W = 10000;
-    F.table = calloc(F.W, sizeof(blist_t));
-    F.occupied = calloc(F.W, 1);
-    F.kidx = kh_init(i2i);
-    F.cur_read = bp_get(&F.bp);
-    if (sam_read1(F.in, F.hdr, F.cur_read) < 0) die("StopIteration: empty input");
-    while (!F.finished) {
-        rf_fill_table(&F);
-        rf_empty_slot(&F);
-    }
-    rf_empty_table(&F);
-    sam_close(F.in);
-    if (sam_close(F.out) < 0) die("error closing output");
-    if (pool) hts_tpool_destroy(pool);
-    return 0;
-}
-
-/* ------------------------------------------------------------------------ */
 
 static void usage(void)
 {
@@ -1774,9 +1801,9 @@ static void usage(void)
 "usage: hornet <command> [options]\n\n"
 "commands:\n"
 "  find_intersecting_snps   find reads overlapping SNPs, write reads to remap\n"
-"  filter_remapped_reads    keep reads that remapped to the same position\n"
-"  rmdup                    unbiased duplicate removal, single-end\n"
-"  rmdup_pe                 unbiased duplicate removal, paired-end\n");
+"  filter_remapped_reads    keep reads that remapped exactly like the original\n\n"
+"Remove duplicates with Picard MarkDuplicates --DUPLICATE_SCORING_STRATEGY RANDOM\n"
+"(see README).\n");
     exit(2);
 }
 
@@ -1793,10 +1820,6 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "filter_remapped_reads") || !strcmp(cmd, "filter_remapped_reads.py") ||
         !strcmp(cmd, "filter"))
         return cmd_filter(argc, argv);
-    if (!strcmp(cmd, "rmdup") || !strcmp(cmd, "rmdup.py"))
-        return cmd_rmdup(argc, argv);
-    if (!strcmp(cmd, "rmdup_pe") || !strcmp(cmd, "rmdup_pe.py"))
-        return cmd_rmdup_pe(argc, argv);
     usage();
     return 2;
 }

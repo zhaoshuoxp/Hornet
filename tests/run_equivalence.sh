@@ -1,8 +1,9 @@
 #!/bin/bash
 # 1. With --legacy, the optimised Python scripts and the C binary must produce
 #    exactly the same output as the original Hornet code (upstream e642ac0).
-# 2. By default (bugs fixed) Python and C must agree with each other, and the
-#    differences from the original must be exactly the intended fixes.
+# 2. In the default mode (bugs fixed, read flag filters, --max-seqs, VCF
+#    input, WASP-like filter) both must produce exactly the same output as
+#    the simple reference implementations ref_find.py / ref_filter_strict.py.
 #
 #   tests/run_equivalence.sh [workdir]
 #
@@ -14,7 +15,7 @@ REPO=$(dirname "$HERE")
 WORK=${1:-$(mktemp -d)}
 ORIG_COMMIT=e642ac0
 mkdir -p "$WORK/orig"
-for f in find_intersecting_snps.py filter_remapped_reads.py rmdup.py rmdup_pe.py; do
+for f in find_intersecting_snps.py filter_remapped_reads.py; do
     git -C "$REPO" show $ORIG_COMMIT:mapping/$f > "$WORK/orig/$f"
 done
 HORNET_C="$REPO/c/hornet"
@@ -26,8 +27,8 @@ check() { # description, then a command that returns 0 on success
     local d=$1; shift
     if "$@"; then pass=$((pass+1)); echo "ok    $d"; else fail=$((fail+1)); echo "FAIL  $d"; fi
 }
-same_bam() { cmp -s <(samtools view --no-PG -h "$1") <(samtools view --no-PG -h "$2"); }
-same_gz() { cmp -s <(zcat "$1") <(zcat "$2"); }
+same_bam() { [ -s "$1" ] && [ -s "$2" ] && cmp -s <(samtools view --no-PG -h "$1") <(samtools view --no-PG -h "$2"); }
+same_gz() { [ -s "$1" ] && [ -s "$2" ] && cmp -s <(zcat "$1") <(zcat "$2"); }
 stats() { grep -v -E 'Loading|Done with|Finished|Starting' "$1"; }
 
 # find_intersecting_snps: compare one implementation with the original
@@ -109,99 +110,99 @@ for mode in pe se; do
     fi
 done
 
-# ---------------------------------------------------------------------------
-# Default (fixed) behaviour
-# ---------------------------------------------------------------------------
-fis_fixed() { # data bam "flags"
-    local D=$1 B=$2 F=$3
-    local b=${B%.*} W=$D/fixed_$(echo "$B $F" | tr -c 'a-zA-Z0-9\n' '_') x
-    rm -rf "$W"; mkdir -p "$W/orig" "$W/py" "$W/c"
-    for x in orig py c; do
+# ===========================================================================
+# 2. Default mode vs the reference implementations
+# ===========================================================================
+LAST_W=
+ref_fis() { # data bam "flags" text|vcf snp_dir|vcf_file [sample]
+    local D=$1 B=$2 F=$3 kind=$4 src=$5 smp=${6:-}
+    local b=${B%.*} x ok=0
+    local W=$D/def_$(echo "$B $F $kind $(basename $src) $smp" | tr -c 'a-zA-Z0-9\n' '_')
+    rm -rf "$W"; mkdir -p "$W/ref" "$W/py" "$W/c"
+    for x in py c; do
         ln -s "$D/$B" "$W/$x/$B"
         [ -e "$D/$B.bai" ] && ln -s "$D/$B.bai" "$W/$x/$B.bai"
     done
-    (cd "$W/orig" && python3 "$WORK/orig/find_intersecting_snps.py" $F $B "$D/snps" > stdout 2> stderr)
-    (cd "$W/py" && $PYFIS $F $B "$D/snps" > stdout 2> stderr)
-    local impl=py
-    if [ -n "$HORNET_C" ]; then
-        (cd "$W/c" && "$HORNET_C" find_intersecting_snps $F $B "$D/snps" > stdout 2> stderr)
-        impl="py c"
+    local RA HA
+    if [ $kind = text ]; then RA="--snp-dir $src"; HA=""; else
+        RA="--vcf $src"; HA="--vcf $src"
+        [ -n "$smp" ] && { RA="$RA --sample $smp"; HA="$HA --sample $smp"; }
     fi
-    local ok=0 fq
-    for x in $impl; do
-        for f in keep.bam to.remap.bam dropped.bam; do same_bam "$W/orig/$b.$f" "$W/$x/$b.$f" || ok=1; done
-        # remap fastqs: only the qualities of reverse-strand reads change
-        if [ -e "$W/orig/$b.remap.fq1.gz" ]; then
-            python3 "$HERE/check_fastq_quals.py" "$W/orig/$b.to.remap.bam" \
-                "$W/orig/$b.remap.fq1.gz" "$W/$x/$b.remap.fq1.gz" \
-                "$W/orig/$b.remap.fq2.gz" "$W/$x/$b.remap.fq2.gz" > /dev/null || ok=1
-        else
-            python3 "$HERE/check_fastq_quals.py" "$W/orig/$b.to.remap.bam" \
-                "$W/orig/$b.remap.fq.gz" "$W/$x/$b.remap.fq.gz" > /dev/null || ok=1
-        fi
+    python3 "$HERE/ref_find.py" $F $RA "$D/$B" "$W/ref/$b" || return 1
+    if [ $kind = text ]; then
+        (cd "$W/py" && $PYFIS $F $B $src > stdout 2> stderr)
+        [ -n "$HORNET_C" ] && (cd "$W/c" && "$HORNET_C" find_intersecting_snps $F $B $src > stdout 2> stderr)
+    else
+        (cd "$W/py" && $PYFIS $F $HA $B > stdout 2> stderr)
+        [ -n "$HORNET_C" ] && (cd "$W/c" && "$HORNET_C" find_intersecting_snps $F $HA $B > stdout 2> stderr)
+    fi
+    local impls=py; [ -n "$HORNET_C" ] && impls="py c"
+    for x in $impls; do
+        for f in keep to.remap dropped; do
+            same_bam "$W/ref/$b.$f.sam" "$W/$x/$b.$f.bam" || { ok=1; echo "   $x $f.bam differs"; }
+        done
+        for f in remap.fq remap.fq1 remap.fq2; do
+            [ -e "$W/ref/$b.$f" ] || continue
+            cmp -s "$W/ref/$b.$f" <(zcat "$W/$x/$b.$f.gz") || { ok=1; echo "   $x $f differs"; }
+        done
         stats "$W/$x/stdout" > "$W/$x.txt"
     done
-    stats "$W/orig/stdout" > "$W/orig.txt"
-    if [ -n "$HORNET_C" ]; then
-        for fq in "$W"/py/*.fq*.gz; do same_gz "$fq" "$W/c/$(basename "$fq")" || ok=1; done
-        cmp -s "$W/py.txt" "$W/c.txt" || ok=1
-    fi
-    if echo "$F" | grep -q -- -P; then
-        # phased statistics are now counted (the original divided by zero)
-        grep -q "Total SNPs covered: 0$" "$W/py.txt" && ok=1
-        grep -q "non ref/alt base" "$W/py.txt" || ok=1
-    else
-        cmp -s "$W/orig.txt" "$W/py.txt" || ok=1
-    fi
+    [ -n "$HORNET_C" ] && { cmp -s "$W/py.txt" "$W/c.txt" || { ok=1; echo "   statistics differ"; }; }
+    LAST_W=$W
     return $ok
 }
+
 for D in data_a data_b; do
-    for B in pe.bam pe.sorted.bam; do
-        check "fixed find_intersecting_snps $D/$B -p"    fis_fixed "$WORK/$D" $B "-p"
-        check "fixed find_intersecting_snps $D/$B -p -P" fis_fixed "$WORK/$D" $B "-p -P"
-    done
-    check "fixed find_intersecting_snps $D/se.bam"       fis_fixed "$WORK/$D" se.bam ""
+    S=$WORK/$D/snps
+    check "default find $D/pe.bam -p"                ref_fis "$WORK/$D" pe.bam "-p" text $S
+    check "default find $D/pe.bam -p -P"             ref_fis "$WORK/$D" pe.bam "-p -P" text $S
+    check "default find $D/pe.sorted.bam -p"         ref_fis "$WORK/$D" pe.sorted.bam "-p" text $S
+    check "default find $D/pe.bam -p --max-seqs 8"   ref_fis "$WORK/$D" pe.bam "-p --max-seqs 8" text $S
+    check "default find $D/pe.bam -p -C chr3"        ref_fis "$WORK/$D" pe.bam "-p -C chr3" text $S
+    check "default find $D/se.bam"                   ref_fis "$WORK/$D" se.bam "" text $S
+    check "default find $D/se.bam -P"                ref_fis "$WORK/$D" se.bam "-P" text $S
+    check "default find $D/se.bam --max-seqs 4"      ref_fis "$WORK/$D" se.bam "--max-seqs 4" text $S
 done
-check "fixed find_intersecting_snps -j 8 (python) = serial" eval '
-    W=$WORK/data_b/fixed_j; rm -rf $W; mkdir -p $W; ln -s $WORK/data_b/pe.sorted.bam* $W/;
-    (cd $W && $PYFIS -p -j 8 pe.sorted.bam $WORK/data_b/snps > stdout 2>&1) &&
-    S=$WORK/data_b/fixed_pe_sorted_bam__p/py &&
-    same_bam $S/pe.sorted.keep.bam $W/pe.sorted.keep.bam &&
-    same_bam $S/pe.sorted.to.remap.bam $W/pe.sorted.to.remap.bam &&
-    same_gz $S/pe.sorted.remap.fq1.gz $W/pe.sorted.remap.fq1.gz &&
-    same_gz $S/pe.sorted.remap.fq2.gz $W/pe.sorted.remap.fq2.gz'
+check "default find all.txt.gz -p"                   ref_fis "$WORK/data_c" pe.bam "-p" text $WORK/data_c/snps
 
-# filter_remapped_reads: compare with a straightforward reference implementation
+# VCF input: same as the equivalent SNP files
+python3 "$HERE/make_vcf.py" data_a/snps data_a/pe.bam data_a/test.vcf.gz data_a/snps_from_vcf 5
+for F in "-p" "-p -P" ""; do
+    B=pe.bam; [ -z "$F" ] && B=se.bam
+    check "default find --vcf $B $F" ref_fis "$WORK/data_a" $B "$F" vcf $WORK/data_a/test.vcf.gz sample1
+    VW=$LAST_W
+    check "default find snp files equivalent to --vcf, $B $F" ref_fis "$WORK/data_a" $B "$F" text $WORK/data_a/snps_from_vcf
+    TW=$LAST_W
+    check "  --vcf output = SNP-file output ($B $F)" eval '(b=${B%.*}; for f in keep to.remap dropped; do same_bam $VW/py/$b.$f.bam $TW/py/$b.$f.bam || exit 1; done; for f in $VW/py/*.fq*.gz; do same_gz $f $TW/py/$(basename $f) || exit 1; done)'
+done
+
+# Python per-chromosome parallel mode = serial
+for B in pe.sorted.bam se.sorted.bam; do
+    F="-p"; [ $B = se.sorted.bam ] && F=""
+    check "default find -j 8 = serial, data_b/$B" eval '(
+        W=$WORK/data_b/def_j_$B; rm -rf $W; mkdir -p $W; ln -s $WORK/data_b/$B $WORK/data_b/$B.bai $W/;
+        (cd $W && $PYFIS $F -j 8 $B $WORK/data_b/snps > stdout 2> stderr);
+        ref_fis "$WORK/data_b" $B "$F" text $WORK/data_b/snps > /dev/null; S=$LAST_W/py; b=${B%.*};
+        for f in keep to.remap dropped; do same_bam $S/$b.$f.bam $W/$b.$f.bam || exit 1; done;
+        for f in $S/*.fq*.gz; do same_gz $f $W/$(basename $f) || exit 1; done)'
+done
+
+# filter_remapped_reads (WASP-like) vs reference; remapped BAM in random order
 for mode in pe se; do
-    D=$WORK/data_b; P=-p; [ $mode = se ] && P=""
-    R=$(cat "$D/last_orig_$mode.sorted$( [ -n "$P" ] && echo "$P" | tr -c 'a-zA-Z0-9\n' '_')")
-    python3 "$HERE/ref_filter.py" $P "$R/$mode.sorted.to.remap.bam" "$D/$mode.remap.bam" "$D/f.ref.sam"
-    python3 "$REPO/mapping/filter_remapped_reads.py" $P "$R/$mode.sorted.to.remap.bam" "$D/$mode.remap.bam" "$D/f.pyfix.bam" 2> "$D/f.pyfix.err"
-    check "fixed python filter_remapped_reads $mode = reference" same_bam "$D/f.ref.sam" "$D/f.pyfix.bam"
+    D=$WORK/data_b; P=-p; B=pe.bam; [ $mode = se ] && { P=""; B=se.bam; }
+    ref_fis "$D" $B "$P" text $D/snps > /dev/null; R=$LAST_W/py; b=${B%.*}
+    if [ $mode = pe ]; then fq="$R/$b.remap.fq1.gz $R/$b.remap.fq2.gz"; else fq="$R/$b.remap.fq.gz"; fi
+    python3 "$HERE/sim_remap_strict.py" "$R/$b.to.remap.bam" "$D/strict.$mode.remap.bam" 11 $fq
+    python3 "$HERE/ref_filter_strict.py" $P "$R/$b.to.remap.bam" "$D/strict.$mode.remap.bam" "$D/strict.$mode.ref.sam"
+    python3 "$REPO/mapping/filter_remapped_reads.py" $P "$R/$b.to.remap.bam" "$D/strict.$mode.remap.bam" "$D/strict.$mode.py.bam" 2> "$D/strict.$mode.py.err"
+    check "default filter_remapped_reads $mode (python) = reference" same_bam "$D/strict.$mode.ref.sam" "$D/strict.$mode.py.bam"
     if [ -n "$HORNET_C" ]; then
-        "$HORNET_C" filter_remapped_reads $P "$R/$mode.sorted.to.remap.bam" "$D/$mode.remap.bam" "$D/f.cfix.bam" 2> "$D/f.cfix.err"
-        check "fixed C filter_remapped_reads $mode = reference" eval 'same_bam "$D/f.ref.sam" "$D/f.cfix.bam" && cmp -s <(stats "$D/f.pyfix.err") <(stats "$D/f.cfix.err")'
+        "$HORNET_C" filter_remapped_reads -t 4 $P "$R/$b.to.remap.bam" "$D/strict.$mode.remap.bam" "$D/strict.$mode.c.bam" 2> "$D/strict.$mode.c.err"
+        check "default filter_remapped_reads $mode (C) = reference" eval 'same_bam "$D/strict.$mode.ref.sam" "$D/strict.$mode.c.bam" && cmp -s <(stats "$D/strict.$mode.py.err") <(stats "$D/strict.$mode.c.err")'
     fi
-    if [ $mode = pe ]; then
-        python3 "$WORK/orig/filter_remapped_reads.py" -p "$R/$mode.sorted.to.remap.bam" "$D/$mode.remap.bam" "$D/f.orig.pe.bam" 2> /dev/null
-        check "fixed filter_remapped_reads pe = original" same_bam "$D/f.orig.pe.bam" "$D/f.pyfix.bam"
-    fi
-done
-
-# rmdup / rmdup_pe with the same random seed
-python3 "$HERE/mkdup.py" data_b/pe.sorted.bam data_b/dup.pe.bam
-python3 "$HERE/mkdup.py" data_b/se.sorted.bam data_b/dup.se.bam
-for seed in 1 42 -3 123456789012; do
-    for t in rmdup:se rmdup_pe:pe; do
-        prog=${t%%:*}; m=${t#*:}
-        python3 "$HERE/shim_run.py" $seed "$WORK/orig/$prog.py" data_b/dup.$m.bam data_b/$prog.orig.bam
-        python3 "$REPO/mapping/$prog.py" --seed $seed data_b/dup.$m.bam data_b/$prog.py.bam
-        check "python $prog --seed $seed" same_bam data_b/$prog.orig.bam data_b/$prog.py.bam
-        if [ -n "$HORNET_C" ]; then
-            "$HORNET_C" $prog --seed $seed data_b/dup.$m.bam data_b/$prog.c.bam
-            check "C $prog --seed $seed" same_bam data_b/$prog.orig.bam data_b/$prog.c.bam
-        fi
-    done
+    check "  ... and some reads were discarded for each reason ($mode)" eval '(
+        e=$D/strict.$mode.py.err; for k in "another position" "secondary" "unmapped or missing"; do
+        n=$(grep "$k" $e | grep -o "[0-9]*$"); [ "${n:-0}" -gt 0 ] || exit 1; done)'
 done
 
 echo

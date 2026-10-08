@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
 """ find_intersecting_snps
 
-This is a rewrite of the official WASP code.  It has a more straightforward
-design, that is faster and has no maximum window size, but requires loading all
-SNPs into memory at once.
+Find the reads that overlap heterozygous SNPs and write, for each of them,
+the versions of the read with the other allele(s) for remapping (step 2 of
+the Hornet/WASP pipeline; see README.rst).
 
-High-performance version
-------------------------
-Output is identical (record for record, byte for byte after decompression) to
-the original Hornet implementation, but:
+Outputs, next to the input BAM (<base> = input name without extension):
+  <base>.keep.bam       reads that overlap no SNP (kept without remapping)
+  <base>.to.remap.bam   original reads that must be remapped
+  <base>.remap.fq.gz    allele-swapped reads to remap (.fq1.gz/.fq2.gz for -p)
+  <base>.dropped.bam    reads overlapping indels / too many SNPs / with
+                        inconsistent mates
 
-  * SNPs are stored in compact sorted arrays (~6-12 bytes per SNP instead of
-    ~150 bytes in nested dicts), and parsed with pandas when available.
-  * Reads are intersected with SNPs by binary search over the aligned blocks
-    of the CIGAR, instead of materialising every aligned base of every read.
-    Reads that do not touch a variant never leave the fast path.
-  * BAM (de)compression is multi-threaded through htslib (``--threads``), and
-    fastq files are compressed with ``pigz`` when it is available.
-  * ``-j/--processes`` splits a coordinate-sorted, indexed BAM by chromosome
-    and processes chromosomes in parallel. Outputs are stitched back together
-    in the original order and remap IDs are renumbered, so the result is the
-    same as a serial run.
-
+Implementation notes: SNPs are kept in sorted arrays (~12 bytes per SNP)
+and found by binary search over the aligned blocks of the CIGAR; BAM and
+fastq (de)compression is multi-threaded (-t); -j processes the chromosomes of
+a sorted, indexed BAM in parallel with an order-preserving merge (output
+identical to a serial run). --legacy reproduces the original Hornet code
+exactly. The C program c/hornet implements the same tool, with identical
+output, several times faster.
 """
 from __future__ import print_function
 import sys
@@ -53,7 +50,9 @@ try:
 except ImportError:  # pragma: no cover
     np = None
 
-MAX_SEQS_PER_READ = 32
+# Maximum number of allelic combinations (including the original) per read
+# or read pair; set by --max-seqs (the original code used 32).
+MAX_SEQS_PER_READ = 64
 DRAW_PROGRESS = False
 # Reproduce the original Hornet output exactly, including its bugs
 # (--legacy). See README.rst, "Fixes".
@@ -98,10 +97,16 @@ class SNPTable(object):
             code = len(self.alleles)
             self._allele_index[alleles] = code
             self.alleles.append(alleles)
-            # Original: ('-' in alleles) or (max(len(i) for i in alleles) > 1)
-            # where iterating a string yields single characters.
-            self.is_indel.append(('-' in alleles) or
-                                 (max(len(i) for i in alleles) > 1))
+            if LEGACY:
+                # Original: ('-' in alleles) or (max(len(i) for i in alleles)
+                # > 1), where iterating a string yields single characters, so
+                # only '-' marked an indel.
+                self.is_indel.append(('-' in alleles) or
+                                     (max(len(i) for i in alleles) > 1))
+            else:
+                # Like WASP: anything but a single-base ref and alt (e.g.
+                # 'A AT' or 'C G,T') is treated as an indel/unsupported site.
+                self.is_indel.append(('-' in alleles) or len(alleles) != 2)
         return code
 
     def __len__(self):
@@ -308,6 +313,69 @@ def get_snps(snpdir, chrom_only=None, processes=1):
     return table
 
 
+def get_snps_vcf(vcf, sample=None, chrom_only=None):
+    """Heterozygous sites of one sample from a VCF/BCF file.
+
+    SNVs (single-base alleles) are stored with the sample's two alleles.
+    Every reference base covered by a heterozygous indel or other non-SNV
+    allele is marked as an indel site, so that overlapping reads are dropped.
+    Homozygous and missing genotypes are ignored.
+    """
+    import pysam
+    verbosity = pysam.set_verbosity(0)   # no 'index not found' message
+    vf = pysam.VariantFile(vcf)
+    pysam.set_verbosity(verbosity)
+    samples = list(vf.header.samples)
+    if sample is None:
+        if len(samples) != 1:
+            sys.exit("ERROR: %s has %d samples; choose one with --sample"
+                     % (vcf, len(samples)))
+        sample = samples[0]
+    elif sample not in samples:
+        sys.exit("ERROR: sample %s not found in %s" % (sample, vcf))
+    vf.subset_samples([sample])
+    print(_now(), ".... Loading heterozygous sites of sample", sample, "from", vcf)
+    table = SNPTable()
+    snv = defaultdict(lambda: ([], []))
+    indel = defaultdict(list)
+    if chrom_only is not None:
+        try:
+            it = vf.fetch(chrom_only)
+        except (ValueError, KeyError):
+            it = (r for r in vf if r.chrom == chrom_only)
+    else:
+        it = vf
+    VALID = set('ACGT')
+    for rec in it:
+        gt = rec.samples[0]['GT']
+        if gt is None or len(gt) != 2 or gt[0] is None or gt[1] is None \
+                or gt[0] == gt[1]:
+            continue
+        al = rec.alleles
+        i, j = sorted(gt)
+        a, b = al[i], al[j]
+        if len(a) == 1 and len(b) == 1 and a in VALID and b in VALID:
+            ent = snv[rec.chrom]
+            ent[0].append(rec.start)
+            ent[1].append(a + b)
+        else:
+            indel[rec.chrom].extend(range(rec.start, max(rec.stop, rec.start + 1)))
+    indel_code = table.allele_code('-')
+    for chrom in set(snv) | set(indel):
+        pos, alls = snv.get(chrom, ([], []))
+        codes = [table.allele_code(x) for x in alls]
+        ipos = indel.get(chrom, [])
+        # indel marks come last so that they win over SNVs at the same base
+        table.set_chrom(chrom,
+                        np.asarray(list(pos) + list(ipos), dtype=np.int64),
+                        np.asarray(codes + [indel_code] * len(ipos),
+                                   dtype=np.int64))
+    if len(table) == 0:
+        print("ERROR: no heterozygous sites found for sample", sample)
+        sys.exit(1)
+    return table
+
+
 ###############################################################################
 # Read processing
 ###############################################################################
@@ -427,6 +495,59 @@ def get_read_seqs_sites(read, sites, n_aligned, table, dispositions):
     if len(seqs) > MAX_SEQS_PER_READ and prev + 1 < n_aligned:
         dispositions['toss_manysnps'] += 1
         return []
+    if len(seqs) == 1:
+        dispositions['no_snps'] += 1
+    else:
+        dispositions['has_snps'] += 1
+    return seqs
+
+
+def get_read_seqs_checked(read, sites, table, dispositions, phased=False):
+    """Single-end allelic versions of a read (default, non-legacy mode).
+
+    Reads overlapping an indel are dropped, then reads with more than
+    MAX_SEQS_PER_READ allelic combinations. Unphased: every combination of
+    the alleles (bases matching neither allele are left alone). Phased (-P):
+    one version with every SNP switched to the other allele.
+    """
+    alleles_of = table.alleles
+    is_indel = table.is_indel
+    for site in sites:
+        if is_indel[site[3]]:
+            dispositions['toss_indel'] += 1
+            return []
+    if product(len(alleles_of[site[3]]) for site in sites) > MAX_SEQS_PER_READ:
+        dispositions['toss_manysnps'] += 1
+        return []
+    seq0 = read.seq
+    if phased:
+        new = list(seq0)
+        for _, read_pos, _, code in sites:
+            alleles = alleles_of[code]
+            dispositions['total_snps'] += 1
+            k = alleles.find(seq0[read_pos])
+            if k < 0:
+                dispositions['no_match'] += 1
+                dispositions['non_refalt_base'] += 1
+                return []
+            dispositions['ref_match'] += 1
+            new[read_pos] = alleles[1 - k]
+        dispositions['has_snps'] += 1
+        return [seq0, ''.join(new)]
+    seqs = [seq0]
+    for _, read_pos, _, code in sites:
+        dispositions['total_snps'] += 1
+        alleles = alleles_of[code]
+        read_base = seq0[read_pos]
+        if read_base in alleles:
+            dispositions['ref_match'] += 1
+            for new_allele in alleles:
+                if new_allele == read_base:
+                    continue
+                for seq in list(seqs):
+                    seqs.append(seq[:read_pos] + new_allele + seq[read_pos+1:])
+        else:
+            dispositions['no_match'] += 1
     if len(seqs) == 1:
         dispositions['no_snps'] += 1
     else:
@@ -711,6 +832,12 @@ def write_read_seqs(both_read_seqs, keep, remap_bam, fastqs, dropped=None, remap
 # Main loop
 ###############################################################################
 
+# Reads dropped before anything else (default mode): unmapped, secondary,
+# QC-fail, supplementary; for pairs also reads whose mate is unmapped.
+FLAG_DROP_SINGLE = 0x4 | 0x100 | 0x200 | 0x800
+FLAG_DROP_PAIRED = FLAG_DROP_SINGLE | 0x8
+
+
 class PlainTextWriter(object):
     """Uncompressed buffered writer with the GzipTextWriter interface."""
 
@@ -769,7 +896,7 @@ def process_reads(insam, table, out_prefix, is_paired=True, phased=False,
     stored_append = stored.append
     read_results = Counter()
     remap_num = 1
-    n_total = n_skipped = n_nosnps = n_not_proper = n_unmapped = 0
+    n_total = n_skipped = n_nosnps = n_not_proper = n_unmapped = n_flagged = 0
     keep_write = keep.write
     dropped_write = dropped_bam.write
 
@@ -793,8 +920,12 @@ def process_reads(insam, table, out_prefix, is_paired=True, phased=False,
                 continue
             n_total += 1
             if not is_paired:
-                if phased:
-                    raise NotImplementedError("Not yet implemented. It should work with paired end reads, though")
+                if LEGACY:
+                    if phased:
+                        raise NotImplementedError("Not yet implemented. It should work with paired end reads, though")
+                elif read.flag & FLAG_DROP_SINGLE:
+                    n_flagged += 1
+                    continue
                 if tid >= 0 and nonempty[tid]:
                     sites, n_al = find_sites(read, tabs[tid])
                 else:
@@ -803,13 +934,24 @@ def process_reads(insam, table, out_prefix, is_paired=True, phased=False,
                     n_nosnps += 1
                     keep_write(read)
                     continue
-                read_seqs = get_read_seqs_sites(read, sites, n_al, table,
-                                                read_results)
+                if LEGACY:
+                    read_seqs = get_read_seqs_sites(read, sites, n_al, table,
+                                                    read_results)
+                else:
+                    read_seqs = get_read_seqs_checked(read, sites, table,
+                                                      read_results, phased)
                 remap_num += write_read_seqs([(read, read_seqs)], keep, remap_bam,
                                              fastqs, dropped_bam, remap_num)
                 continue
 
             flag = read.flag
+            if not LEGACY:
+                if flag & FLAG_DROP_PAIRED:
+                    n_flagged += 1
+                    continue
+                if not flag & 2 or read.next_reference_id != tid:
+                    n_not_proper += 1
+                    continue
             if flag & 2:  # proper pair
                 slot_self = 1 if flag & 128 else 0 # 0 if is_read1, 1 if is_read2
                 slot_other = 1 if flag & 64 else 0
@@ -866,6 +1008,7 @@ def process_reads(insam, table, out_prefix, is_paired=True, phased=False,
     read_results['no_snps'] += n_nosnps
     read_results['not_proper_pair'] += n_not_proper
     read_results['unmapped read'] += n_unmapped
+    read_results['flagged'] += n_flagged
 
     out = {
         'results': read_results,
@@ -903,6 +1046,11 @@ def print_stats(read_results, n_unpaired, is_paired, keep_only, phased=False):
         print("  Total input reads:", total_pairs)
     if keep_only is not None:
         print("  Reads on skipped chromosomes", read_results['skipped'])
+    if not LEGACY:
+        print("  Reads dropped [unmapped/secondary/supplementary/QC-fail"
+              + ("/mate unmapped" if is_paired else "") + "]:",
+              read_results['flagged'], "(" + _pct(read_results['flagged'],
+                                                  total_pairs) + "%)")
 
     print("  Reads with no SNPs:", read_results['no_snps'], "(" + _pct(read_results\
         ['no_snps'], total_pairs) + "%)")
@@ -924,9 +1072,10 @@ def print_stats(read_results, n_unpaired, is_paired, keep_only, phased=False):
     if is_paired:
         print("  Reads dropped [anomalous pair]:", read_results['toss_anomalous_phase'], "(" + \
             _pct(read_results['toss_anomalous_phase'], total_pairs) + "%)")
-        if phased and not LEGACY:
-            print("  Reads dropped [non ref/alt base]:", read_results['non_refalt_base'], "(" + \
-                _pct(read_results['non_refalt_base'], total_pairs) + "%)")
+    if phased and not LEGACY:
+        print("  Reads dropped [non ref/alt base]:", read_results['non_refalt_base'], "(" + \
+            _pct(read_results['non_refalt_base'], total_pairs) + "%)")
+    if is_paired:
         print("  Reads dropped [not proper pair]:", read_results['not_proper_pair'], "(" + \
             _pct(read_results['not_proper_pair'], total_pairs) + "%)")
 
@@ -1217,11 +1366,21 @@ if __name__ == "__main__":
     parser.add_argument('-t', '--threads', type=int, default=4,
                         help=('Threads for BAM/fastq (de)compression '
                               '(default: 4)'))
+    parser.add_argument('--vcf', default=None,
+                        help=('VCF/BCF file with genotypes; the heterozygous '
+                              'sites of --sample are used instead of snp_dir.'))
+    parser.add_argument('--sample', default=None,
+                        help='Sample in --vcf (default: the only sample)')
+    parser.add_argument('--max-seqs', type=int, default=64,
+                        help=('Drop reads (pairs) with more than this many '
+                              'allelic combinations, i.e. more than '
+                              'log2(N) SNPs (default: 64)'))
     parser.add_argument('--legacy', action='store_true', default=False,
                         help=('Reproduce the output of the original Hornet '
                               'code exactly, including its bugs (phased-mode '
                               'statistics, qualities of reverse-strand reads '
-                              'in the remap fastqs).'))
+                              'in the remap fastqs), with no read flag '
+                              'filtering and --max-seqs 32.'))
     parser.add_argument('-j', '--processes', type=int, default=1,
                         help=('Process chromosomes in parallel with this many '
                               'worker processes. Requires a coordinate sorted '
@@ -1231,27 +1390,39 @@ if __name__ == "__main__":
                               '(default: 1)'))
 
 
-    parser.add_argument("infile", help=("Coordinate sorted bam "
-                                        "file."))
+    parser.add_argument("infile", help="BAM/SAM/CRAM file from the first mapping")
     snp_dir_help = ('Directory containing the SNPs segregating within the '
                     'sample in question (which need to be checked for '
                     'mappability issues).  This directory should contain '
                     'sorted files of SNPs separated by chromosome and named: '
                     '<chrname>.snps.txt.gz (where chrname is the name of the '
                     'chromosomes in the bam file). These files should contain '
-                    '3 columns: position RefAllele AltAllele')
+                    '3 columns: position RefAllele AltAllele. Not needed '
+                    'with --vcf.')
 
-    parser.add_argument("snp_dir", action='store', help=snp_dir_help)
+    parser.add_argument("snp_dir", nargs='?', default=None, help=snp_dir_help)
 
     options = parser.parse_args()
     DRAW_PROGRESS = False
     if options.progressbar:
         DRAW_PROGRESS = True
     LEGACY = options.legacy
+    if (options.vcf is None) == (options.snp_dir is None):
+        parser.error("give either snp_dir or --vcf")
+    if LEGACY:
+        if options.vcf or options.max_seqs != 64:
+            parser.error("--legacy cannot be combined with --vcf or --max-seqs")
+        MAX_SEQS_PER_READ = 32
+    else:
+        MAX_SEQS_PER_READ = options.max_seqs
 
     INSAM = Samfile(options.infile, threads=max(1, options.threads))
-    SNP_DICT = get_snps(options.snp_dir, options.limit_to_chrom,
-                        options.processes)
+    if options.vcf:
+        SNP_DICT = get_snps_vcf(options.vcf, options.sample,
+                                options.limit_to_chrom)
+    else:
+        SNP_DICT = get_snps(options.snp_dir, options.limit_to_chrom,
+                            options.processes)
 
     print(_now(), ".... Done with SNPs.")
     sys.stdout.flush()

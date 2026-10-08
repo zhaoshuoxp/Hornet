@@ -1,22 +1,156 @@
 #!/usr/bin/env python3
 """filter_remapped_reads
 
-This is a rewrite of the official WASP code, which no longer requires
-a .num.gz file. This code is compatable with the rewritten version of
-the first step (find_intersecting_snps), which no longer generates the
-.num.gz file. The bam file of remapped reads must be sorted by read name.
+Keep the reads (pairs) from to.remap.bam for which every allelic version
+remapped exactly like the original read.
 
-High-performance version: identical output to the original Hornet code, with
-a single parse of each read name, cached reference names, a C-level CIGAR
-test and multi-threaded BAM (de)compression (``--threads``).
+Default (WASP-like) criteria, for each remapped record of a read (pair):
+
+* not a secondary or supplementary alignment (any such record discards the
+  read: the swapped read maps to more than one place);
+* mapped to the same chromosome, start position and strand as the original,
+  with the same CIGAR (hard clips ignored);
+* paired-end: flagged as a proper pair, and its mate is at the original
+  mate position;
+* the number of such records equals the number of versions written by
+  find_intersecting_snps (times two for pairs).
+
+The remapped BAM can be in any order.
+
+--legacy runs the original Hornet algorithm instead (start position only,
+CIGAR restricted to M/N/S operations; needs a remapped BAM sorted by read
+name), reproducing its output exactly.
 
 """
 from __future__ import print_function
 import sys
 import gzip
+import re
 import time
+from array import array
 
 import pysam
+
+_HARD_CLIP = re.compile(r'[0-9]+H')
+
+
+def _cigar_key(cigarstring):
+    if cigarstring is None:
+        return 0
+    if 'H' in cigarstring:
+        cigarstring = _HARD_CLIP.sub('', cigarstring)
+    return hash(cigarstring)
+
+
+def _now():
+    return time.strftime(("%b %d ") + time.strftime("%I:%M:%S"))
+
+
+def run_strict(to_remap_path, remap_path, keep_path, is_paired_end, threads=1):
+    """WASP-like filter; see the module docstring."""
+    sys.stderr.write("{} Starting run\n".format(_now()))
+    threads = max(1, threads)
+    n = 2 if is_paired_end else 1
+
+    # Pass 1: the original reads, in remap-ID order (n records per ID)
+    to_remap = pysam.AlignmentFile(to_remap_path, "rb", threads=threads)
+    orig_tid = array('i', [-1])
+    orig_pos = array('q', [0] * n)
+    orig_rev = bytearray(n)
+    orig_cig = array('q', [0] * n)
+    k = 0
+    for rec in to_remap:
+        if k % n == 0:
+            orig_tid.append(rec.reference_id)
+        orig_pos.append(rec.reference_start)
+        orig_rev.append(1 if rec.is_reverse else 0)
+        orig_cig.append(_cigar_key(rec.cigarstring))
+        k += 1
+    if k % n:
+        sys.exit("ERROR: %s has an odd number of reads" % to_remap_path)
+    n_ids = k // n
+    names = list(to_remap.references)
+    to_remap.close()
+
+    # Pass 2: remapped reads, any order
+    remap = pysam.AlignmentFile(remap_path, "rb", threads=threads)
+    name_tid = {c: i for i, c in enumerate(names)}
+    tidmap = [name_tid.get(c, -2) for c in remap.references]
+    expected = array('i', [0] * (n_ids + 1))
+    correct = array('i', [0] * (n_ids + 1))
+    moved = bytearray(n_ids + 1)
+    multi = bytearray(n_ids + 1)
+    for rec in remap:
+        fields = rec.query_name.split(':')
+        last = fields[-1]
+        if '/' in last:
+            last = last.split('/', 1)[0]
+        try:
+            rid = int(fields[0])
+            num = int(last)
+        except ValueError:
+            sys.exit("ERROR: unexpected read name %s in %s (not from "
+                     "find_intersecting_snps?)" % (rec.query_name, remap_path))
+        if rid < 1 or rid > n_ids:
+            sys.exit("ERROR: read %s has no counterpart in %s"
+                     % (rec.query_name, to_remap_path))
+        expected[rid] = num * n
+        flag = rec.flag
+        if flag & 0x900:
+            multi[rid] = 1
+            continue
+        if flag & 4:
+            continue
+        m = 1 if (n == 2 and flag & 0x80) else 0
+        j = rid * n + m
+        tid = tidmap[rec.reference_id]
+        ok = (tid == orig_tid[rid] and rec.reference_start == orig_pos[j]
+              and (1 if flag & 16 else 0) == orig_rev[j]
+              and _cigar_key(rec.cigarstring) == orig_cig[j])
+        if ok and n == 2:
+            ok = (flag & 2 and not flag & 8 and rec.next_reference_id >= 0
+                  and tidmap[rec.next_reference_id] == tid
+                  and rec.next_reference_start == orig_pos[rid * n + 1 - m])
+        if ok:
+            correct[rid] += 1
+        else:
+            moved[rid] = 1
+    remap.close()
+
+    # Pass 3: write the kept reads
+    to_remap = pysam.AlignmentFile(to_remap_path, "rb", threads=threads)
+    keep = pysam.AlignmentFile(keep_path, "wb", template=to_remap,
+                               threads=threads)
+    n_keep = n_moved = n_multi = n_missing = 0
+    k = 0
+    keep_write = keep.write
+    for rec in to_remap:
+        rid = k // n + 1
+        k += 1
+        if multi[rid]:
+            if k % n == 0:
+                n_multi += 1
+        elif moved[rid]:
+            if k % n == 0:
+                n_moved += 1
+        elif expected[rid] == 0 or correct[rid] != expected[rid]:
+            if k % n == 0:
+                n_missing += 1
+        else:
+            keep_write(rec)
+            if k % n == 0:
+                n_keep += 1
+    keep.close()
+    to_remap.close()
+    sys.stderr.write("{} Finished\n\n".format(_now()))
+    sys.stderr.write(
+        ("RUN STATISTICS:\n\tTotal remapped read (pair)s: {}\n\t"
+         "Read (pair)s remapped to the correct position: {} {:.2%}\n"
+         "\tDiscarded, remapped to another position, strand or CIGAR: {}\n"
+         "\tDiscarded, secondary/supplementary alignments: {}\n"
+         "\tDiscarded, unmapped or missing remapped reads: {}\n")
+        .format(n_ids, n_keep, n_keep / float(n_ids) if n_ids else 0.0,
+                n_moved, n_multi, n_missing))
 
 
 def _remapped_ok(remap_bam, is_paired_end):
@@ -208,20 +342,25 @@ def main():
     parser.add_argument("-t", "--threads", type=int, default=4,
                         help='Threads for BAM (de)compression (default: 4)')
     parser.add_argument("--legacy", action='store_true', default=False,
-                        help=('Reproduce the original Hornet output exactly, '
-                              'including its single-end bug (the read after '
-                              'each discarded read was skipped).'))
+                        help=('Use the original Hornet algorithm and reproduce '
+                              'its output exactly, including its single-end '
+                              'bug (the read after each discarded read was '
+                              'skipped). Needs a remapped BAM sorted by name.'))
     h = ('to.remap.bam file from find_intersecting_snps.py.')
     parser.add_argument("to_remap_bam", help=h)
-    parser.add_argument("remap_bam", help='Remapped bam file.')
+    parser.add_argument("remap_bam", help='BAM from remapping the fastqs (any order; sorted by name with --legacy)')
     parser.add_argument("keep_bam", help=(
         'File to write correctly remapped reads to.'
     ))
 
     options = parser.parse_args()
 
-    run(options.to_remap_bam, options.remap_bam, options.keep_bam,
-        options.is_paired_end, options.threads, options.legacy)
+    if options.legacy:
+        run(options.to_remap_bam, options.remap_bam, options.keep_bam,
+            options.is_paired_end, options.threads, legacy=True)
+    else:
+        run_strict(options.to_remap_bam, options.remap_bam, options.keep_bam,
+                   options.is_paired_end, options.threads)
 
 if __name__ == '__main__':
     main()
